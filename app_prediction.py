@@ -40,7 +40,7 @@ def to_half_width(text):
     table = str.maketrans('０１２３４５６７８９．', '0123456789.')
     return re.sub(r'[^\d\.]', '', str(text).translate(table))
 
-# --- 2. データ読み込み（F列を正番に強制指定） ---
+# --- 2. データ読み込み（場所/F列対応） ---
 @st.cache_data
 def load_data(file):
     try:
@@ -50,9 +50,9 @@ def load_data(file):
             try: df_raw = pd.read_csv(file, header=None, encoding='utf-8')
             except: df_raw = pd.read_csv(file, header=None, encoding='cp932')
         
-        # 見出し行を自動探索
+        # 見出し行の自動探索
         best_row, max_hits = 0, 0
-        keywords = ['場所', '場名', 'R', '正番', '馬番', '馬名']
+        keywords = ['場所', '場名', 'R', '馬名', '正番']
         for i in range(min(len(df_raw), 30)):
             row_str = "".join(df_raw.iloc[i].astype(str))
             hits = sum(1 for k in keywords if k in row_str)
@@ -60,45 +60,51 @@ def load_data(file):
                 max_hits, best_row = hits, i
         
         df = df_raw.iloc[best_row:].reset_index(drop=True)
-        # F列（6列目）を強制的に「正番」という名前にするために一度列名をリセット
-        new_cols = [str(c).strip() for c in df.iloc[0]]
+        raw_headers = [str(c).strip() for c in df.iloc[0]]
         
-        # 安全策：列が6列以上ある場合、F列（index 5）を「正番」と名付ける
-        if len(new_cols) >= 6:
-            new_cols[5] = "正番"
+        # 1. 強制設定: F列（6番目）を「正番」とする
+        if len(raw_headers) >= 6:
+            raw_headers[5] = "正番"
             
-        df.columns = new_cols
+        df.columns = raw_headers
         df = df.iloc[1:].reset_index(drop=True)
         df = make_cols_unique(df)
 
-        # 自動マッピング
-        col_map = {}
+        # 2. 列名の自動マッピング（「場所」を最優先で「場名」へ）
         mapping_rules = {
-            'R': ['R', 'レース', '番組'],
-            '場名': ['場名', '場所', '競馬場', '開催'],
+            '場名': ['場所', '場名', '競馬場', '開催'],
+            'R': ['R', 'レース', '番組', 'Ｒ'],
             '馬名': ['馬名', '名称'],
             '単ｵｯｽﾞ': ['単ｵｯｽﾞ', '単勝オッズ', 'オッズ'],
-            '着順': ['着順', '着', '結果']
+            '着順': ['着順', '着', '結果', '順位'],
+            '騎手': ['騎手', 'ジョッキー'],
+            '厩舎': ['厩舎', '調教師'],
+            '馬主': ['馬主', 'オーナー']
         }
         
+        col_map = {}
         for internal, keys in mapping_rules.items():
             for c in df.columns:
                 if c in col_map.keys(): continue
-                if any(k in str(c) for k in keys):
+                # 完全一致または部分一致で判定
+                if any(k == str(c) for k in keys) or any(k in str(c) for k in keys):
                     col_map[c] = internal
         
         df = df.rename(columns=col_map)
         df = make_cols_unique(df)
 
-        # 必須列の確保
+        # 3. 必須列の確保
         for col in ['R', '正番', '単ｵｯｽﾞ', '場名', '馬名', '着順']:
             if col not in df.columns:
                 df[col] = np.nan if col == '着順' else (0 if col in ['R', '正番'] else (99.0 if col == '単ｵｯｽﾞ' else "不明"))
 
-        # 数値クリーニング
+        # 4. データの型を整理（「1R」などの文字を除去）
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width).astype(str).str.extract(r'(\d+\.?\d*)', expand=False), errors='coerce').fillna(99.0)
+        
+        # 会場名から余計な空白を消す
+        df['場名'] = df['場名'].astype(str).str.strip().replace('nan', '不明')
         
         return df[df['R'] > 0].copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
@@ -110,7 +116,7 @@ def analyze_haichi(df_curr):
 
     df['青塗フラグ'] = 0; df['ペアフラグ'] = 0; df['前日配置フラグ'] = 0; df['スコア'] = 0.0
     
-    # 逆番・循環計算
+    # 頭数・逆番計算
     df['頭数'] = df.groupby(['場名', 'R'])['正番'].transform('max').fillna(16).astype(int)
     df['逆番'] = (df['頭数'] + 1) - df['正番']
     df['正循環'] = df['頭数'] + df['正番']
@@ -118,12 +124,12 @@ def analyze_haichi(df_curr):
     
     idx_map = {(row['場名'], row['R'], row['正番']): idx for idx, row in df.iterrows()}
     
-    # 青塗などの判定（略記）
+    # 青塗判定 (9.2点)
     for col in ['騎手', '厩舎', '馬主']:
         if col in df.columns:
             g_keys = ['場名', col] if col == '騎手' else [col]
             for name, group in df.groupby(g_keys):
-                if len(group) < 2: continue
+                if len(group) < 2 or not str(name).strip() or str(name) == 'nan': continue
                 all_sets = [{r['正番'], r['逆番'], r['正循環'], r['逆循環']} for _, r in group.iterrows()]
                 common = set.intersection(*all_sets)
                 if common:
@@ -150,7 +156,7 @@ def apply_ranking_logic(df_in):
     return df
 
 # --- 4. UI ---
-st.title("🏇 AI配置分析システム（エラー回避版）")
+st.title("🏇 AI配置分析システム（場所・F列正番対応）")
 
 with st.sidebar:
     st.header("📂 読み込み")
@@ -163,13 +169,14 @@ if up_curr:
             st.session_state['analyzed_df'] = apply_ranking_logic(analyze_haichi(df_raw))
         
         full_df = st.session_state['analyzed_df']
-        places = sorted([p for p in full_df['場名'].unique() if p and str(p) != "nan" and str(p) != "不明"])
+        
+        # 安全な会場リストの作成
+        places = sorted([p for p in full_df['場名'].unique() if p and str(p) not in ['nan', '不明', 'None']])
 
-        # 【エラー回避】会場が見つかった場合のみタブを表示
         if places:
             st.subheader("📝 予測・結果入力")
             with st.form("result_form"):
-                p_tabs = st.tabs(places) # ここでエラーが出ていたのをガード
+                p_tabs = st.tabs(places)
                 edited_dfs = []
                 for p_tab, place in zip(p_tabs, places):
                     with p_tab:
@@ -193,5 +200,6 @@ if up_curr:
                     st.session_state['analyzed_df'] = apply_ranking_logic(pd.concat(edited_dfs, ignore_index=True))
                     st.rerun()
         else:
-            st.error("会場名（場名）を特定できませんでした。データ内に『場所』や『競馬場』の項目があるか、データの1行目を確認してください。")
+            st.error("会場（場所）を特定できませんでした。")
             st.write("現在認識されている列名:", list(full_df.columns))
+            st.write("データプレビュー（最初の5行）:", full_df.head())
