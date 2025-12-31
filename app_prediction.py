@@ -25,56 +25,58 @@ def to_half_width(text):
     table = str.maketrans('０１２３４５６７８９．', '0123456789.')
     return re.sub(r'[^\d\.]', '', str(text).translate(table))
 
-# --- 2. データ読み込み（物理位置特定方式） ---
-def bulletproof_load(file):
+# --- 2. データ読み込み（物理インデックス & 強力名寄せ） ---
+def load_and_analyze_robust(file):
     try:
-        # ヘッダーなしで全データを読み込む
+        # ヘッダーなしで読み込み
         if file.name.endswith('.xlsx'):
             df_raw = pd.read_excel(file, header=None, engine='openpyxl')
         else:
             try: df_raw = pd.read_csv(file, header=None, encoding='utf-8')
             except: df_raw = pd.read_csv(file, header=None, encoding='cp932')
         
-        # 見出し行（ヘッダー）を自動探索
+        # 見出し行（ヘッダー）の特定
         best_row, max_hits = 0, 0
         keywords = ['場所', 'R', '馬名', 'オッズ']
-        for i in range(min(len(df_raw), 30)):
+        for i in range(min(len(df_raw), 25)):
             row_vals = [str(x) for x in df_raw.iloc[i].values]
             hits = sum(1 for k in keywords if any(k in v for v in row_vals))
             if hits > max_hits:
                 max_hits, best_row = hits, i
         
-        # ヘッダー情報の取得
+        # データの切り出し
         header_names = [str(x).strip() for x in df_raw.iloc[best_row].values]
-        df_data = df_raw.iloc[best_row+1:].reset_index(drop=True)
+        df = df_raw.iloc[best_row+1:].reset_index(drop=True)
         
-        # --- 列の物理位置を特定 ---
+        # --- 列の物理位置特定 ---
         # F列（インデックス5）は強制的に「正番」
-        col_indices = {'正番': 5 if len(df_data.columns) > 5 else None}
+        col_indices = {'正番': 5 if len(df.columns) > 5 else None}
         
+        # キーワードによる列特定
         mapping_rules = {
-            '場名': ['場所', '場名', '会場'],
-            'R': ['R', 'レース', '番組'],
+            '場名': ['場所', '場名', '会場', '競馬場'],
+            'R': ['R', 'レース', '番組', 'Ｒ', 'r'],
             '馬名': ['馬名', '名称'],
             '単ｵｯｽﾞ': ['単勝', 'オッズ', '単ｵｯｽﾞ'],
             '騎手': ['騎手'], '厩舎': ['厩舎', '調教'], '馬主': ['馬主'],
-            '着順': ['着順', '着', '結果']
+            '着順': ['着順', '着', '結果', '順位']
         }
         
         for internal, keys in mapping_rules.items():
-            if internal in col_indices: continue
+            if internal in col_indices and col_indices[internal] is not None: continue
             for idx, name in enumerate(header_names):
-                if any(k in name for k in keys):
+                if any(k in str(name) for k in keys):
                     col_indices[internal] = idx
                     break
 
-        # 新しいクリーンなデータフレームを作成（重複エラーを物理的に回避）
+        # クリーンなデータフレームを作成
         clean_df = pd.DataFrame()
         for internal, idx in col_indices.items():
-            if idx is not None and idx < len(df_data.columns):
-                clean_df[internal] = df_data.iloc[:, idx]
+            if idx is not None and idx < len(df.columns):
+                clean_df[internal] = df.iloc[:, idx]
             else:
-                clean_df[internal] = np.nan if internal == '着順' else (0 if internal in ['R','正番'] else "")
+                # 見つからない場合はKeyErrorを防ぐためにデフォルト値を入れる
+                clean_df[internal] = np.nan if internal == '着順' else (0 if internal in ['R','正番'] else (99.0 if internal == '単ｵｯｽﾞ' else "不明"))
 
         # 数値クリーニング
         def clean_num(val):
@@ -86,9 +88,8 @@ def bulletproof_load(file):
         clean_df['正番'] = clean_df['正番'].apply(clean_num).astype(int)
         clean_df['単ｵｯｽﾞ'] = clean_df['単ｵｯｽﾞ'].apply(clean_num).replace(0, 99.0)
         
-        clean_df = clean_df[clean_df['R'] > 0].copy()
-        
         # --- 配置判定（青塗） ---
+        clean_df = clean_df[clean_df['R'] > 0].copy()
         clean_df['青塗フラグ'] = 0; clean_df['判定'] = ""
         clean_df['頭数'] = clean_df.groupby(['場名', 'R'])['正番'].transform('max').fillna(16)
         clean_df['逆番'] = (clean_df['頭数'] + 1) - clean_df['正番']
@@ -97,19 +98,19 @@ def bulletproof_load(file):
         
         idx_map = {(row['場名'], row['R'], int(row['正番'])): i for i, row in clean_df.iterrows()}
         for col in ['騎手', '厩舎', '馬主']:
-            if col not in clean_df.columns: continue
-            for name, group in clean_df.groupby(['場名', col] if col=='騎手' else col):
-                if len(group) < 2 or str(name) in ['nan', '', '不明']: continue
-                all_sets = [{r['正番'], r['逆番'], r['正循環'], r['逆循環']} for _, r in group.iterrows()]
-                common = set.intersection(*all_sets)
-                if common:
-                    for _, row in group.iterrows():
-                        key = (row['場名'], row['R'], int(row['正番']))
-                        if key in idx_map:
-                            clean_df.at[idx_map[key], '青塗フラグ'] = 1
-                            clean_df.at[idx_map[key], '判定'] += f"★{col}青塗 "
+            if col in clean_df.columns:
+                for name, group in clean_df.groupby(['場名', col] if col=='騎手' else col):
+                    if len(group) < 2 or str(name) in ['nan', '', '不明']: continue
+                    all_sets = [{r['正番'], r['逆番'], r['正循環'], r['逆循環']} for _, r in group.iterrows()]
+                    common = set.intersection(*all_sets)
+                    if common:
+                        for _, row in group.iterrows():
+                            key = (row['場名'], row['R'], int(row['正番']))
+                            if key in idx_map:
+                                clean_df.at[idx_map[key], '青塗フラグ'] = 1
+                                clean_df.at[idx_map[key], '判定'] += f"★{col}青塗 "
 
-        # AI予測
+        # AI基礎予測
         if model:
             try:
                 X = clean_df[['単ｵｯｽﾞ', '青塗フラグ']].copy()
@@ -126,51 +127,68 @@ def bulletproof_load(file):
 # --- 3. UI ---
 st.title("🏇 AI配置分析：流動バイアス最適化版")
 
-up_file = st.sidebar.file_uploader("当日配置表", type=['xlsx', 'csv'])
+up_file = st.sidebar.file_uploader("当日配置表(Excel/CSV)", type=['xlsx', 'csv'])
 
 if up_file:
-    if 'df' not in st.session_state or st.sidebar.button("🔄 再解析"):
-        res, status = bulletproof_load(up_file)
+    if 'df' not in st.session_state or st.sidebar.button("🔄 データを再解析"):
+        res, status = load_and_analyze_robust(up_file)
         if status == "success": st.session_state['df'] = res
         else: st.error(f"解析失敗: {status}")
 
     if 'df' in st.session_state:
         df = st.session_state['df'].copy()
         
-        # 流動的補正（着順入力によるバイアス計算）
+        # 【流動的ロジック】結果に基づくバイアス計算
         df['当日バイアス'] = 0.0
         if '着順' in df.columns:
             df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
             hits = df[df['着順'] <= 3]
             if not hits.empty:
-                # 「今日の青塗の的中率」を計算してボーナス値を決定
-                bias = (len(hits[hits['青塗フラグ'] == 1]) / len(hits)) * 12.0
-                df.loc[df['青塗フラグ'] == 1, '当日バイアス'] = bias
+                # 「今日の配置パターンの的中率」を計算し、期待値に加算
+                bias_val = (len(hits[hits['青塗フラグ'] == 1]) / len(hits)) * 15.0
+                df.loc[df['青塗フラグ'] == 1, '当日バイアス'] = bias_val
 
-        df['期待値'] = df['AI激走確率'] + df['当日バイアス']
+        df['最終期待値'] = df['AI激走確率'] + df['当日バイアス']
         
-        places = sorted([p for p in df['場名'].unique() if str(p) not in ['nan','None','不明']])
+        # 会場とレースの選択
+        places = sorted([p for p in df['場名'].unique() if str(p) not in ['nan','不明']])
         
         if places:
-            target_p = st.sidebar.selectbox("会場", places)
+            target_p = st.sidebar.selectbox("会場を選択", places)
             r_list = sorted(df[df['場名'] == target_p]['R'].unique())
-            target_r = st.sidebar.selectbox("レース", r_list)
+            target_r = st.sidebar.selectbox("レースを選択", r_list)
 
-            view = df[(df['場名'] == target_p) & (df['R'] == target_r)].sort_values('期待値', ascending=False)
+            view = df[(df['場名'] == target_p) & (df['R'] == target_r)].sort_values('最終期待値', ascending=False)
             st.subheader(f"📊 {target_p} {int(target_r)}R 激走予測")
             
-            show_cols = ['正番', '馬名', '単ｵｯｽﾞ', 'AI激走確率', '当日バイアス', '期待値', '判定', '着順']
+            # 表示列の定義
+            show_cols = ['正番', '馬名', '単ｵｯｽﾞ', 'AI激走確率', '当日バイアス', '最終期待値', '判定', '着順']
             final_cols = [c for c in show_cols if c in view.columns]
             
+            # データエディタで着順を入力可能に
             ed = st.data_editor(view[final_cols], key=f"ed_{target_p}_{target_r}", 
                                 hide_index=True, use_container_width=True,
-                                column_config={"期待値": st.column_config.ProgressColumn(min_value=0, max_value=100)})
+                                column_config={
+                                    "最終期待値": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
+                                    "正番": st.column_config.NumberColumn(format="%d")
+                                })
             
-            if st.button("🔄 着順を確定して今日の流れを反映"):
+            if st.button("🔄 入力した着順を保存して今日の流れを反映"):
                 for _, row in ed.iterrows():
                     st.session_state['df'].loc[(st.session_state['df']['場名']==target_p) & 
                                                (st.session_state['df']['R']==target_r) & 
                                                (st.session_state['df']['正番']==row['正番']), '着順'] = row['着順']
                 st.rerun()
+
+            # 傾向分析
+            st.divider()
+            with st.expander("📈 今日の配置バイアス分析"):
+                hits_summary = df[df['着順'] <= 3]
+                if not hits_summary.empty:
+                    st.plotly_chart(px.pie(hits_summary['判定'].value_counts().reset_index(), values='count', names='index', title="的中パターンの内訳", hole=0.4))
+                else:
+                    st.info("着順が入力されると、今日の配置傾向がここに表示されます。")
         else:
-            st.error("会場を特定できませんでした。")
+            st.error("会場（場所）が特定できませんでした。")
+else:
+    st.info("左側のサイドバーからファイルをアップロードしてください。")
