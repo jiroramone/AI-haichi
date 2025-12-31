@@ -2,173 +2,271 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import requests
+from bs4 import BeautifulSoup
 import pickle
 import os
+import plotly.express as px
 
 # --- 1. 基本設定 ---
-st.set_page_config(page_title="全自動・配置予測システム", layout="wide")
+st.set_page_config(page_title="配置馬券術 分析システム", layout="wide")
 
-# AIモデルの読み込み
+# AIモデル読み込み
+MODEL_PATH = 'model.pkl'
 @st.cache_resource
-def get_model():
-    if os.path.exists('model.pkl'):
+def load_ai_model():
+    if os.path.exists(MODEL_PATH):
         try:
-            with open('model.pkl', 'rb') as f:
+            with open(MODEL_PATH, 'rb') as f:
                 return pickle.load(f)
         except: return None
     return None
 
-model = get_model()
+model = load_ai_model()
 
-# --- 2. 自動クリーニング関数群 ---
-def make_unique(cols):
-    """重複した列名を自動リネーム"""
-    new_cols = []
+# 重複カラム対策
+def make_cols_unique(df):
+    cols = []
     counts = {}
-    for c in cols:
-        c_str = str(c).strip() if pd.notna(c) else "Unnamed"
+    for col in df.columns:
+        c_str = str(col).strip() if pd.notna(col) else "Unnamed"
         if c_str in counts:
             counts[c_str] += 1
-            new_cols.append(f"{c_str}_{counts[c_str]}")
+            cols.append(f"{c_str}_{counts[c_str]}")
         else:
             counts[c_str] = 0
-            new_cols.append(c_str)
-    return new_cols
+            cols.append(c_str)
+    df.columns = cols
+    return df
 
-def auto_extract_num(val):
-    """'1R'や'15.5倍'から数字だけを抽出"""
-    if pd.isna(val): return 0
-    match = re.search(r'(\d+\.?\d*)', str(val).replace(',', ''))
-    return float(match.group(1)) if match else 0
+def to_half_width(text):
+    if pd.isna(text): return text
+    text = str(text)
+    table = str.maketrans('０１２３４５６７８９．', '0123456789.')
+    return re.sub(r'[^\d\.]', '', text.translate(table))
 
-# --- 3. 自動読み込みエンジン ---
-def auto_load_and_analyze(file):
+def normalize_name(x):
+    if pd.isna(x): return ''
+    s = str(x).strip().replace('　', '').replace(' ', '')
+    s = re.split(r'[,(（/]', s)[0]
+    return re.sub(r'[★☆▲△◇$*]', '', s)
+
+# --- 2. データ読み込み（原型を維持しつつ強化） ---
+@st.cache_data
+def load_data(file):
     try:
         if file.name.endswith('.xlsx'):
-            df_raw = pd.read_excel(file, header=None)
+            df = pd.read_excel(file, engine='openpyxl')
         else:
-            try: df_raw = pd.read_csv(file, header=None, encoding='utf-8')
-            except: df_raw = pd.read_csv(file, header=None, encoding='cp932')
+            try: df = pd.read_csv(file, encoding='utf-8')
+            except: df = pd.read_csv(file, encoding='cp932')
         
-        # 【自動探索】本物のヘッダー行（項目名がある行）を探す
-        best_row = 0
-        max_hits = 0
-        keywords = ['場所', '場名', 'R', 'レース', '馬番', '番', '馬名', 'オッズ', '単勝']
-        
-        for i in range(min(len(df_raw), 30)):
-            row_str = "".join(df_raw.iloc[i].astype(str))
-            hits = sum(1 for k in keywords if k in row_str)
-            if hits > max_hits:
-                max_hits = hits
-                best_row = i
-        
-        # ヘッダー設定と重複排除
-        df = df_raw.iloc[best_row:].reset_index(drop=True)
-        df.columns = make_unique(df.iloc[0])
-        df = df.iloc[1:].reset_index(drop=True)
+        df = make_cols_unique(df)
 
-        # 【自動名寄せ】列名のマッチング
-        col_map = {}
-        mapping_rules = {
-            'R': ['R', 'Ｒ', 'レース', '番組'],
-            '場名': ['場所', '場名', '競馬場', '会場', '開催'],
-            '正番': ['番', '馬番', '正番', '枠番'],
-            '馬名': ['馬名', '馬', '名称'],
-            '単ｵｯｽﾞ': ['オッズ', '単勝', '単ｵｯｽﾞ', '単オッズ'],
-            '騎手': ['騎手', 'ジョッキー'],
-            '厩舎': ['厩舎', '調教師']
-        }
-
-        for internal_name, keys in mapping_rules.items():
-            for c in df.columns:
-                if any(k in str(c) for k in keys):
-                    col_map[c] = internal_name
+        # ヘッダー位置自動調整
+        if not any(col in str(df.columns) for col in ['馬', '番', 'R', '場所']):
+            for i in range(min(len(df), 15)):
+                row_values = [str(x) for x in df.iloc[i].values]
+                if any('場所' in x or '番' in x or 'R' in x for x in row_values):
+                    df.columns = df.iloc[i]
+                    df = df.iloc[i+1:].reset_index(drop=True)
+                    df = make_cols_unique(df)
                     break
+
+        df.columns = df.columns.astype(str).str.strip()
+        name_map = {
+            '場所': '場名', '開催': '場名', '競馬場': '場名',
+            '調教師': '厩舎', '調教師名': '厩舎', '厩舎名': '厩舎',
+            'レース': 'R', 'Ｒ': 'R', '番': '正番', '馬番': '正番',
+            '単オッズ': '単ｵｯｽﾞ', '単勝オッズ': '単ｵｯｽﾞ', 'オッズ': '単ｵｯｽﾞ', '着': '着順'
+        }
+        df = df.rename(columns=name_map)
+        df = make_cols_unique(df) # リネーム後の重複対策
+
+        ensure_cols = ['R', '場名', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ', '着順']
+        for col in ensure_cols:
+            if col not in df.columns: df[col] = np.nan
+
+        df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce').fillna(0).astype(int)
+        df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce').fillna(0).astype(int)
+        df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce').fillna(99.0)
         
-        df = df.rename(columns=col_map)
+        for col in ['騎手', '厩舎', '馬主', '馬名', '場名']:
+            df[col] = df[col].astype(str).apply(normalize_name)
+            
+        return df.copy(), "success"
+    except Exception as e: return pd.DataFrame(), str(e)
+
+# --- 3. 配置計算エンジン（原型の配点を完全維持） ---
+def analyze_haichi(df_curr, df_prev=None):
+    df = df_curr.copy()
+    if 'タイプ' in df.columns and df['タイプ'].notna().any(): return df
+
+    df['頭数'] = df.groupby(['場名', 'R'])['正番'].transform('max').fillna(16).astype(int)
+    df['逆番'] = (df['頭数'] + 1) - df['正番']
+    df['正循環'] = df['頭数'] + df['正番']
+    df['逆循環'] = df['頭数'] + df['逆番']
+
+    # AI予測用フラグ
+    df['青塗フラグ'] = 0; df['ペアフラグ'] = 0; df['前日配置フラグ'] = 0
+
+    df['タイプ_list'] = [[] for _ in range(len(df))]
+    df['属性_list'] = [[] for _ in range(len(df))]
+    df['パターン_list'] = [[] for _ in range(len(df))]
+    df['スコア'] = 0.0
+    idx_map = {(row['場名'], row['R'], row['正番']): idx for idx, row in df.iterrows()}
+
+    # A. 青塗判定 (配点 9.2)
+    for col in ['騎手', '厩舎', '馬主']:
+        g_keys = ['場名', col] if col == '騎手' else [col]
+        for name, group in df.groupby(g_keys):
+            if len(group) < 2 or not name: continue
+            all_sets = [{r['正番'], r['逆番'], r['正循環'], r['逆循環']} for _, r in group.iterrows()]
+            common = set.intersection(*all_sets)
+            if common:
+                for _, row in group.iterrows():
+                    idx = idx_map.get((row['場名'], row['R'], row['正番']))
+                    if idx is not None:
+                        df.at[idx, '青塗フラグ'] = 1
+                        df.at[idx, 'タイプ_list'].append(f'★{col}青塗')
+                        df.at[idx, '属性_list'].append(f'{col}:{name}')
+                        df.at[idx, 'パターン_list'].append('青塗')
+                        df.at[idx, 'スコア'] += 9.2
+
+    # B. ペア判定 (配点 3.0-4.0)
+    pair_labels = list("ABCDEFGHIJKLMNOP")
+    for col in ['騎手', '厩舎', '馬主']:
+        for name, group in df.groupby(['場名', col] if col=='騎手' else col):
+            if len(group) < 2 or not name: continue
+            rows = group.sort_values('R').to_dict('records')
+            for i in range(len(rows)-1):
+                r1, r2 = rows[i], rows[i+1]
+                v1, v2 = [r1[c] for c in ['正番','逆番','正循環','逆循環']], [r2[c] for c in ['正番','逆番','正循環','逆循環']]
+                pats = [pair_labels[x*4+y] for x in range(4) for y in range(4) if v1[x]==v2[y] and v1[x]!=0]
+                if pats:
+                    df.at[idx_map[(r1['場名'],r1['R'],r1['正番'])], 'ペアフラグ'] = 1
+                    df.at[idx_map[(r2['場名'],r2['R'],r2['正番'])], 'ペアフラグ'] = 1
+                    is_c = any(x in pats for x in ['C','D','G','H'])
+                    for r_data in [r1, r2]:
+                        idx = idx_map.get((r_data['場名'], r_data['R'], r_data['正番']))
+                        if idx is not None:
+                            df.at[idx, 'タイプ_list'].append('◎チャンス' if is_c else '○狙い目')
+                            df.at[idx, '属性_list'].append(f'{col}:{name}')
+                            df.at[idx, 'パターン_list'].append("".join(pats))
+                            df.at[idx, 'スコア'] += 4.0 if is_c else 3.0
+
+    # C. 前日同配置 (配点 8.3)
+    if df_prev is not None and not df_prev.empty:
+        for idx, row in df.iterrows():
+            prev_match = df_prev[(df_prev['場名'] == row['場名']) & (df_prev['R'] == row['R']) & (df_prev['騎手'] == row['騎手'])]
+            for _, p_row in prev_match.iterrows():
+                if {row['正番'],row['逆番'],row['正循環'],row['逆循環']}.intersection({p_row['正番'],p_row['逆番'],p_row['正循環'],p_row['逆循環']}):
+                    df.at[idx, '前日配置フラグ'] = 1
+                    df.at[idx, 'タイプ_list'].append('★前日同配置'); df.at[idx, '属性_list'].append(f'前日:騎手:{row["騎手"]}'); df.at[idx, 'スコア'] += 8.3
+
+    # D. AI予測の統合
+    if model:
+        try:
+            X = df[['単ｵｯｽﾞ', '青塗フラグ', 'ペアフラグ', '前日配置フラグ']].fillna(0)
+            probs = model.predict_proba(X)
+            df['AI激走確率'] = [round(p[1] * 100, 1) for p in probs]
+        except: df['AI激走確率'] = 0.0
+
+    df['タイプ'] = df['タイプ_list'].apply(lambda x: ' / '.join(x) if x else '無')
+    df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(list(set(x))) if x else '無')
+    df['パターン'] = df['パターン_list'].apply(lambda x: ','.join(x) if x else '')
+    return df
+
+# --- 4. 判定ロジック（原型のランキングロジックを維持） ---
+def apply_ranking_logic(df_in):
+    if df_in.empty: return df_in
+    df = df_in.copy()
+    df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
+    hit_results = df[df['着順'] <= 3]
+    hit_attrs = set([a.replace('隣:', '').replace('前日:', '') for _, row in hit_results.iterrows() for a in str(row.get('属性', '')).split(' / ')])
+    hit_pats = set([p for pats in hit_results['パターン'].dropna() for p in str(pats).split(',') if p])
+
+    def get_metrics(row):
+        score = row.get('スコア', 0); p_list = str(row.get('パターン', '')).split(',')
+        ai_p = row.get('AI激走確率', 0)
+        bonus = 4.0 if any(p in hit_pats and len(p)==1 for p in p_list) else 0.0
         
-        # 必須列の補完（無い場合は0埋め）
-        for c in ['R', '場名', '正番', '馬名', '単ｵｯｽﾞ']:
-            if c not in df.columns: df[c] = "" if c in ['場名', '馬名'] else 0
+        reasons = []
+        for ra in str(row.get('属性', '')).split(' / '):
+            cra = ra.replace('隣:', '').replace('前日:', '')
+            if cra in hit_attrs: reasons.append(f"{cra.split(':')[0] if ':' in cra else '本人'}好走")
+        
+        penalty = -3.0 if reasons else 0.0
+        # 総合スコア（AI確率を1/10にして加算する調整）
+        total = score + bonus + penalty + (ai_p / 10.0) + (-30.0 if pd.to_numeric(row.get('単ｵｯｽﾞ'), errors='coerce') > 49.9 else 0.0)
+        rec = "👑 盤石の軸" if total >= 18 else "✨ 推奨軸" if total >= 14 else "🔥 激熱相手" if total >= 11 else "▲ 配置注目" if score > 0 else ""
+        return pd.Series([total, f"⚠️{','.join(set(reasons))}(-3)" if reasons else "", rec])
 
-        # 型の自動変換
-        df['R'] = df['R'].apply(auto_extract_num).astype(int)
-        df['正番'] = df['正番'].apply(auto_extract_num).astype(int)
-        df['単ｵｯｽﾞ'] = df['単ｵｯｽﾞ'].apply(auto_extract_num)
-        df['場名'] = df['場名'].astype(str).str.strip().replace('　', '')
+    df[['総合スコア', 'エネルギー状態', '推奨買い目'] ] = df.apply(get_metrics, axis=1)
+    return df
 
-        # 1R以上の有効行のみ
-        df = df[df['R'] > 0].copy()
+# --- 5. UI（原型のタブ・エディタ構成を維持） ---
+st.title("🏇 配置馬券術 AI・分析統合システム")
 
-        # 配置解析（青塗フラグ）
-        df['青塗フラグ'] = 0
-        for col in ['騎手', '厩舎']:
-            if col in df.columns:
-                mask = (df[col].astype(str).str.strip() != "")
-                dup = df[mask].duplicated(subset=['場名', col], keep=False)
-                df.loc[df.index[mask][dup], '青塗フラグ'] = 1
+with st.sidebar:
+    st.header("📂 読み込み")
+    up_curr = st.file_uploader("当日データ", type=['xlsx', 'csv'], key="curr")
+    up_prev = st.file_uploader("前日データ", type=['xlsx', 'csv'], key="prev")
+    
+    if up_curr:
+        if 'analyzed_df' in st.session_state:
+            st.divider(); st.header("💾 保存")
+            csv = st.session_state['analyzed_df'].to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📥 分析CSVを保存", csv, f"progress_{up_curr.name}.csv")
 
-        # AI予測
-        if model and not df.empty:
-            try:
-                X = pd.DataFrame({
-                    '単ｵｯｽﾞ': df['単ｵｯｽﾞ'].replace(0, 99.0),
-                    '青塗フラグ': df['青塗フラグ'],
-                    'ペアフラグ': 0, '前日配置フラグ': 0
-                }).fillna(0)
-                probs = model.predict_proba(X)
-                df['AI激走確率'] = [round(p[1] * 100, 1) for p in probs]
-            except: df['AI激走確率'] = 0.0
-        else:
-            df['AI激走確率'] = 0.0
+if up_curr:
+    df_raw, status = load_data(up_curr)
+    df_p_raw, _ = load_data(up_prev) if up_prev else (None, None)
+    
+    if status == "success":
+        if 'analyzed_df' not in st.session_state:
+            st.session_state['analyzed_df'] = apply_ranking_logic(analyze_haichi(df_raw, df_p_raw))
+        
+        full_df = st.session_state['analyzed_df']
 
-        return df
-    except Exception as e:
-        st.error(f"自動読み取りに失敗しました: {e}")
-        return pd.DataFrame()
+        # ① 結果入力（原型のタブ構成）
+        st.subheader("📝 結果入力 & 予測")
+        with st.form("result_form"):
+            places = sorted(full_df['場名'].unique())
+            p_tabs = st.tabs(places); edited_dfs = []
+            for p_tab, place in zip(p_tabs, places):
+                with p_tab:
+                    p_df = full_df[full_df['場名'] == place]
+                    r_tabs = st.tabs([f"{r}R" for r in sorted(p_df['R'].unique())])
+                    for r_tab, r_num in zip(r_tabs, sorted(p_df['R'].unique())):
+                        with r_tab:
+                            race_full = p_df[p_df['R'] == r_num].sort_values('正番')
+                            # 確率を表示列に追加
+                            disp_cols = ['正番','馬名','単ｵｯｽﾞ','AI激走確率','属性','総合スコア','着順','推奨買い目']
+                            disp = race_full.copy()
+                            ed = st.data_editor(disp[disp_cols], hide_index=True, use_container_width=True, key=f"ed_{place}_{r_num}",
+                                                column_config={"AI激走確率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100)})
+                            updated = race_full.copy()
+                            for _, row in ed.iterrows(): updated.loc[updated['正番'] == row['正番'], '着順'] = row['着順']
+                            edited_dfs.append(updated)
+            if st.form_submit_button("🔄 入力を確定して更新"):
+                st.session_state['analyzed_df'] = apply_ranking_logic(pd.concat(edited_dfs, ignore_index=True)); st.rerun()
 
-# --- 4. メイン UI ---
-st.title("🏇 AI配置予測（全自動・高速読込版）")
+        # ② 統計表示（原型の円グラフ）
+        st.divider(); st.subheader("📈 的中傾向")
+        df_res = full_df[full_df['着順'].notna()].copy()
+        if not df_res.empty:
+            s_tabs = st.tabs(["合計"] + sorted(full_df['場名'].unique()))
+            for s_tab, s_pl in zip(s_tabs, ["合計"] + sorted(full_df['場名'].unique())):
+                with s_tab:
+                    df_s = df_res if s_pl == "合計" else df_res[df_res['場名'] == s_pl]
+                    df_fk = df_s[df_s['着順'] <= 3]
+                    if not df_s.empty:
+                        c1, c2 = st.columns([1, 2])
+                        with c1: st.metric("複勝率", f"{len(df_fk)/len(df_s)*100:.1f}%"); st.metric("的中数", len(df_fk))
+                        with c2:
+                            all_p = [p for pats in df_fk['パターン'] for p in str(pats).split(',') if p]
+                            if all_p: st.plotly_chart(px.pie(pd.Series(all_p).value_counts().reset_index(), values='count', names='index', hole=0.4), use_container_width=True)
 
-file = st.sidebar.file_uploader("当日配置表をアップロード", type=['xlsx', 'csv'])
-
-if file:
-    # 初回読み込み
-    if 'auto_df' not in st.session_state or st.sidebar.button("🔄 データを再読込"):
-        with st.spinner('データを自動スキャン中...'):
-            st.session_state['auto_df'] = auto_load_and_analyze(file)
-
-    df = st.session_state['auto_df']
-
-    if not df.empty:
-        # 会場とレースの選択
-        places = sorted([p for p in df['場名'].unique() if p != ""])
-        if places:
-            st.sidebar.divider()
-            target_place = st.sidebar.selectbox("会場を選択", places)
-            r_list = sorted(df[df['場名'] == target_place]['R'].unique())
-            target_r = st.sidebar.selectbox("レースを選択", r_list)
-
-            # 表示
-            view = df[(df['場名'] == target_place) & (df['R'] == target_r)].sort_values('AI激走確率', ascending=False)
-            
-            st.subheader(f"📊 {target_place} {target_r}R 予測結果")
-            
-            # 推奨馬をカード表示
-            top = view.iloc[0]
-            st.info(f"👑 AI推奨馬: {top['正番']}番 {top['馬名']} (確率 {top['AI激走確率']}%)")
-
-            st.dataframe(
-                view[['正番', '馬名', '単ｵｯｽﾞ', 'AI激走確率', '青塗フラグ']],
-                column_config={
-                    "AI激走確率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-                    "単ｵｯｽﾞ": st.column_config.NumberColumn(format="%.1f")
-                },
-                use_container_width=True, hide_index=True
-            )
-        else:
-            st.warning("会場名を自動特定できませんでした。エクセルの内容を確認してください。")
-    else:
-        st.error("有効なデータが見つかりませんでした。")
 else:
-    st.info("👈 サイドバーからファイルをアップロードしてください。すべて自動で解析します。")
+    st.info("左側のサイドバーからファイルを読み込んでください。")
