@@ -22,7 +22,7 @@ def load_ai_model():
 
 model = load_ai_model()
 
-# 重複列名の回避
+# 重複列名の回避（pyarrowエラー対策）
 def make_cols_unique(df):
     cols = []
     counts = {}
@@ -39,7 +39,6 @@ def make_cols_unique(df):
 
 def to_half_width(text):
     if pd.isna(text): return text
-    text = str(text)
     table = str.maketrans('０１２３４５６７８９．', '0123456789.')
     return re.sub(r'[^\d\.]', '', str(text).translate(table))
 
@@ -49,7 +48,7 @@ def normalize_name(x):
     s = re.split(r'[,(（/]', s)[0]
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み（自動マッピング強化） ---
+# --- 2. データ読み込み（自動判定強化） ---
 @st.cache_data
 def load_data(file):
     try:
@@ -59,10 +58,10 @@ def load_data(file):
             try: df_raw = pd.read_csv(file, header=None, encoding='utf-8')
             except: df_raw = pd.read_csv(file, header=None, encoding='cp932')
         
-        # 見出し行を自動探索
+        # 見出し行の自動探索
         best_row, max_hits = 0, 0
-        keywords = ['場所', '場名', 'R', 'レース', '番', '馬名', 'オッズ', '単勝']
-        for i in range(min(len(df_raw), 25)):
+        keywords = ['場所', '場名', 'R', 'レース', '番', '馬名', 'オッズ', '着順']
+        for i in range(min(len(df_raw), 30)):
             row_str = "".join(df_raw.iloc[i].astype(str))
             hits = sum(1 for k in keywords if k in row_str)
             if hits > max_hits:
@@ -73,17 +72,17 @@ def load_data(file):
         df = df.iloc[1:].reset_index(drop=True)
         df = make_cols_unique(df)
 
-        # 列名の自動マッピング
+        # 列名の自動マッピング（キーワードを大幅追加）
         mapping_rules = {
             'R': ['R', 'Ｒ', 'レース', '番組'],
             '場名': ['場所', '場名', '競馬場', '会場', '開催'],
-            '正番': ['番', '馬番', '正番', '枠番'],
-            '馬名': ['馬名', '馬', '名称'],
-            '単ｵｯｽﾞ': ['オッズ', '単勝', '単ｵｯｽﾞ', '単オッズ'],
-            '騎手': ['騎手', 'ジョッキー'],
-            '厩舎': ['厩舎', '調教師'],
-            '馬主': ['馬主', 'オーナー'],
-            '着順': ['着順', '着', '順位']
+            '正番': ['番', '馬番', '正番', '枠番', 'UMABAN'],
+            '馬名': ['馬名', '馬', '名称', 'HORSE'],
+            '単ｵｯｽﾞ': ['オッズ', '単勝', '単ｵｯｽﾞ', '単ｵｯズ'],
+            '騎手': ['騎手', 'ジョッキー', 'JOCKEY'],
+            '厩舎': ['厩舎', '調教師', 'TRAINER'],
+            '馬主': ['馬主', 'オーナー', 'OWNER'],
+            '着順': ['着順', '着', '順位', '結果', 'ランク']
         }
         
         col_map = {}
@@ -94,20 +93,28 @@ def load_data(file):
         df = df.rename(columns=col_map)
         df = make_cols_unique(df)
 
-        # 必須列の型変換
-        if 'R' in df.columns: df['R'] = pd.to_numeric(df['R'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
-        if '正番' in df.columns: df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
-        if '単ｵｯｽﾞ' in df.columns: df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width).astype(str).str.extract(r'(\d+\.?\d*)', expand=False), errors='coerce').fillna(99.0)
+        # 【超重要】必須列が欠けている場合、エラーにせず空で作る
+        essential_cols = {
+            'R': 0, '正番': 0, '単ｵｯｽﾞ': 99.0, '場名': "不明", 
+            '馬名': "不明", '騎手': "", '厩舎': "", '馬主': "", '着順': np.nan
+        }
+        for col, default in essential_cols.items():
+            if col not in df.columns:
+                df[col] = default
+
+        # 型のクリーンアップ
+        df['R'] = pd.to_numeric(df['R'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
+        df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
+        df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width).astype(str).str.extract(r'(\d+\.?\d*)', expand=False), errors='coerce').fillna(99.0)
         
         for col in ['場名', '馬名', '騎手', '厩舎', '馬主']:
-            if col in df.columns: df[col] = df[col].astype(str).apply(normalize_name)
-            else: df[col] = ""
+            df[col] = df[col].astype(str).apply(normalize_name)
 
         return df[df['R'] > 0].copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
 
-# --- 3. 解析・AIエンジン ---
-def analyze_haichi(df_curr, df_prev=None):
+# --- 3. 解析・AIロジック ---
+def analyze_haichi(df_curr):
     df = df_curr.copy()
     if 'タイプ' in df.columns and df['タイプ'].notna().any(): return df
 
@@ -119,7 +126,6 @@ def analyze_haichi(df_curr, df_prev=None):
     df['タイプ_list'] = [[] for _ in range(len(df))]
     idx_map = {(row['場名'], row['R'], row['正番']): idx for idx, row in df.iterrows()}
 
-    # 青塗判定
     for col in ['騎手', '厩舎', '馬主']:
         if col not in df.columns: continue
         g_keys = ['場名', col] if col == '騎手' else [col]
@@ -133,7 +139,6 @@ def analyze_haichi(df_curr, df_prev=None):
                     if idx is not None:
                         df.at[idx, '青塗フラグ'] = 1; df.at[idx, 'タイプ_list'].append(f'★{col}青塗'); df.at[idx, 'スコア'] += 9.2
 
-    # AI予測
     if model:
         try:
             X = df[['単ｵｯｽﾞ', '青塗フラグ', 'ペアフラグ', '前日配置フラグ']].fillna(0)
@@ -152,7 +157,7 @@ def apply_ranking_logic(df_in):
     return df
 
 # --- 4. UI ---
-st.title("🏇 配置馬券 AI分析・管理システム")
+st.title("🏇 配置馬券術 AI分析・管理システム")
 
 with st.sidebar:
     st.header("📂 読み込み")
@@ -182,34 +187,37 @@ if up_curr:
                     for r_tab, r_num in zip(r_tabs, sorted(p_df['R'].unique())):
                         with r_tab:
                             race_full = p_df[p_df['R'] == r_num].sort_values('正番')
-                            # 【KeyError対策】存在する列だけを表示対象にする
-                            potential_cols = ['評価','正番','馬名','単ｵｯｽﾞ','AI激走確率','タイプ','総合スコア','着順']
-                            disp_cols = [c for c in potential_cols if c in race_full.columns]
+                            # 表示列の調整（存在する列だけ出す）
+                            target_cols = ['評価','正番','馬名','単ｵｯｽﾞ','AI激走確率','タイプ','総合スコア','着順']
+                            disp_cols = [c for c in target_cols if c in race_full.columns]
                             
                             ed = st.data_editor(race_full[disp_cols], hide_index=True, use_container_width=True, key=f"ed_{place}_{r_num}",
                                                 column_config={"AI激走確率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100)})
                             
-                            # 更新用データの保持
                             updated = race_full.copy()
                             for _, row in ed.iterrows():
                                 if '着順' in row: updated.loc[updated['正番'] == row['正番'], '着順'] = row['着順']
                             edited_dfs.append(updated)
             
-            # 【Missing Submit Button対策】フォームの最後にボタンを配置
-            submit = st.form_submit_button("🔄 入力を確定して全データを更新")
-            if submit:
+            if st.form_submit_button("🔄 入力を確定して更新"):
                 st.session_state['analyzed_df'] = apply_ranking_logic(pd.concat(edited_dfs, ignore_index=True))
                 st.rerun()
 
-        # ② 統計表示
+        # ② 的中統計（KeyError対策版）
         st.divider(); st.subheader("📈 的中統計")
-        df_res = full_df[full_df['着順'].notna()].copy()
-        if not df_res.empty:
-            df_fk = df_res[df_res['着順'] <= 3]
-            c1, c2 = st.columns([1, 2])
-            with c1: st.metric("複勝率", f"{len(df_fk)/len(df_res)*100:.1f}%"); st.metric("的中数", len(df_fk))
-            with c2:
-                all_p = [p for pats in df_fk['タイプ'] for p in str(pats).split(' / ') if '無' not in p]
-                if all_p: st.plotly_chart(px.pie(pd.Series(all_p).value_counts().reset_index(), values='count', names='index', hole=0.4), use_container_width=True)
+        # '着順'列があるか、かつ中身が空でないかチェック
+        if '着順' in full_df.columns:
+            df_res = full_df[full_df['着順'].notna()].copy()
+            if not df_res.empty:
+                df_fk = df_res[df_res['着順'] <= 3]
+                c1, c2 = st.columns([1, 2])
+                with c1: st.metric("複勝率", f"{len(df_fk)/len(df_res)*100:.1f}%"); st.metric("的中数", len(df_fk))
+                with c2:
+                    all_p = [p for pats in df_fk['タイプ'] for p in str(pats).split(' / ') if '無' not in p]
+                    if all_p: st.plotly_chart(px.pie(pd.Series(all_p).value_counts().reset_index(), values='count', names='index', hole=0.4), use_container_width=True)
+            else:
+                st.info("着順が入力されると、ここに的中統計が表示されます。")
+        else:
+            st.warning("着順データが読み込めていません。")
 else:
-    st.info("サイドバーからファイルを読み込んでください。")
+    st.info("ファイルを読み込んでください。")
