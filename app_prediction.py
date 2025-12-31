@@ -48,7 +48,7 @@ def normalize_name(x):
     s = re.split(r'[,(（/]', s)[0]
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み（自動判定強化） ---
+# --- 2. データ読み込み（正番の優先度を修正） ---
 @st.cache_data
 def load_data(file):
     try:
@@ -60,7 +60,7 @@ def load_data(file):
         
         # 見出し行の自動探索
         best_row, max_hits = 0, 0
-        keywords = ['場所', '場名', 'R', 'レース', '番', '馬名', 'オッズ', '着順']
+        keywords = ['場所', '場名', 'R', '正番', '馬番', '馬名']
         for i in range(min(len(df_raw), 30)):
             row_str = "".join(df_raw.iloc[i].astype(str))
             hits = sum(1 for k in keywords if k in row_str)
@@ -72,37 +72,39 @@ def load_data(file):
         df = df.iloc[1:].reset_index(drop=True)
         df = make_cols_unique(df)
 
-        # 列名の自動マッピング（キーワードを大幅追加）
+        # 列名の自動マッピング（正番の優先順位を厳格化）
         mapping_rules = {
             'R': ['R', 'Ｒ', 'レース', '番組'],
             '場名': ['場所', '場名', '競馬場', '会場', '開催'],
-            '正番': ['番', '馬番', '正番', '枠番', 'UMABAN'],
+            '正番': ['正番', '馬番', '番', 'UMABAN'], # '枠番'を削除し、正番を先頭に
+            '枠番': ['枠番', '枠'],
             '馬名': ['馬名', '馬', '名称', 'HORSE'],
             '単ｵｯｽﾞ': ['オッズ', '単勝', '単ｵｯｽﾞ', '単ｵｯズ'],
-            '騎手': ['騎手', 'ジョッキー', 'JOCKEY'],
-            '厩舎': ['厩舎', '調教師', 'TRAINER'],
-            '馬主': ['馬主', 'オーナー', 'OWNER'],
-            '着順': ['着順', '着', '順位', '結果', 'ランク']
+            '騎手': ['騎手', 'ジョッキー'],
+            '厩舎': ['厩舎', '調教師'],
+            '馬主': ['馬主', 'オーナー'],
+            '着順': ['着順', '着', '順位', '結果']
         }
         
         col_map = {}
-        for internal_name, keys in mapping_rules.items():
+        # 重要な項目から順にマッチング（枠番より正番を先に処理）
+        for internal_name in ['正番', '場名', 'R', '馬名', '単ｵｯｽﾞ', '着順', '騎手', '厩舎', '馬主']:
+            keys = mapping_rules[internal_name]
             for c in df.columns:
-                if any(k in str(c) for k in keys):
-                    col_map[c] = internal_name; break
+                if c in col_map.keys(): continue # すでに割り当て済みならスキップ
+                if any(k == str(c).strip() for k in keys) or any(k in str(c) for k in keys):
+                    col_map[c] = internal_name
+                    break
+                    
         df = df.rename(columns=col_map)
         df = make_cols_unique(df)
 
-        # 【超重要】必須列が欠けている場合、エラーにせず空で作る
-        essential_cols = {
-            'R': 0, '正番': 0, '単ｵｯｽﾞ': 99.0, '場名': "不明", 
-            '馬名': "不明", '騎手': "", '厩舎': "", '馬主': "", '着順': np.nan
-        }
+        # 必須列の補完
+        essential_cols = {'R': 0, '正番': 0, '単ｵｯｽﾞ': 99.0, '場名': "不明", '着順': np.nan}
         for col, default in essential_cols.items():
-            if col not in df.columns:
-                df[col] = default
+            if col not in df.columns: df[col] = default
 
-        # 型のクリーンアップ
+        # 型変換
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width).astype(str).str.extract(r'(\d+)', expand=False), errors='coerce').fillna(0).astype(int)
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width).astype(str).str.extract(r'(\d+\.?\d*)', expand=False), errors='coerce').fillna(99.0)
@@ -113,7 +115,7 @@ def load_data(file):
         return df[df['R'] > 0].copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
 
-# --- 3. 解析・AIロジック ---
+# --- 3. 配置・AIロジック ---
 def analyze_haichi(df_curr):
     df = df_curr.copy()
     if 'タイプ' in df.columns and df['タイプ'].notna().any(): return df
@@ -175,7 +177,7 @@ if up_curr:
         
         full_df = st.session_state['analyzed_df']
 
-        # ① 結果入力フォーム
+        # ① 結果入力
         st.subheader("📝 予測・結果入力")
         with st.form("result_form"):
             places = sorted(full_df['場名'].unique())
@@ -187,7 +189,6 @@ if up_curr:
                     for r_tab, r_num in zip(r_tabs, sorted(p_df['R'].unique())):
                         with r_tab:
                             race_full = p_df[p_df['R'] == r_num].sort_values('正番')
-                            # 表示列の調整（存在する列だけ出す）
                             target_cols = ['評価','正番','馬名','単ｵｯｽﾞ','AI激走確率','タイプ','総合スコア','着順']
                             disp_cols = [c for c in target_cols if c in race_full.columns]
                             
@@ -199,13 +200,12 @@ if up_curr:
                                 if '着順' in row: updated.loc[updated['正番'] == row['正番'], '着順'] = row['着順']
                             edited_dfs.append(updated)
             
-            if st.form_submit_button("🔄 入力を確定して更新"):
+            if st.form_submit_button("🔄 入力を確定して全体を更新"):
                 st.session_state['analyzed_df'] = apply_ranking_logic(pd.concat(edited_dfs, ignore_index=True))
                 st.rerun()
 
-        # ② 的中統計（KeyError対策版）
+        # ② 統計
         st.divider(); st.subheader("📈 的中統計")
-        # '着順'列があるか、かつ中身が空でないかチェック
         if '着順' in full_df.columns:
             df_res = full_df[full_df['着順'].notna()].copy()
             if not df_res.empty:
@@ -215,9 +215,5 @@ if up_curr:
                 with c2:
                     all_p = [p for pats in df_fk['タイプ'] for p in str(pats).split(' / ') if '無' not in p]
                     if all_p: st.plotly_chart(px.pie(pd.Series(all_p).value_counts().reset_index(), values='count', names='index', hole=0.4), use_container_width=True)
-            else:
-                st.info("着順が入力されると、ここに的中統計が表示されます。")
-        else:
-            st.warning("着順データが読み込めていません。")
 else:
     st.info("ファイルを読み込んでください。")
