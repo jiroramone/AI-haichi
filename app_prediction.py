@@ -42,7 +42,7 @@ def load_data(file):
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
-        # カラム名探索
+        # ヘッダー行の自動探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -96,11 +96,10 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     for c in ['正番', '逆番', '正循環', '逆循環']:
         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
 
-    # 結果格納用 (既存データがあれば保持)
+    # 結果格納用
     if '合計ポイント' not in df.columns: df['合計ポイント'] = 0.0
     if '動的ポイント' not in df.columns: df['動的ポイント'] = 0.0
     
-    # 属性リストの初期化
     if '属性_list' not in df.columns:
         df['属性_list'] = [[] for _ in range(len(df))]
     else:
@@ -198,7 +197,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                         df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_fail']
                         df.at[idx, '属性_list'].append("★前日同配置(凡走)")
                     elif prev_rank <= 3: # 好走
-                        df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_win'] # 減点
+                        df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_win']
                         df.at[idx, '属性_list'].append("▼前日同配置(好走)")
 
     # --- F. オッズ加点 ---
@@ -211,9 +210,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
 
 # --- 4. 動的ロジック (シーソー/玉突き連動) ---
 def update_dynamic_points_chain(df):
-    """
-    3連続以上のペアに対応したシーソー理論
-    """
     if '着順' not in df.columns: return df
     
     df['動的ポイント'] = 0.0
@@ -281,39 +277,74 @@ def generate_betting_ticket(row, race_df):
 # --- 6. UIコンポーネント ---
 
 def render_recommendations(full_df):
-    """画面上部の推奨枠（ランク付き・タブ表示版）"""
+    """画面上部の推奨枠（青塗オッズ判定・ランク付き・タブ表示版）"""
     st.markdown("### 🏆 特選推奨馬 (AI厳選ランク)")
     df = full_df.copy()
     
-    # 1. 抽出条件
-    future = df[pd.to_numeric(df['着順'], errors='coerce').isna()]
-    cond_odds = pd.to_numeric(future['単ｵｯｽﾞ'], errors='coerce').fillna(0) <= 49.9
+    # --- 特別ロジック: 青塗隣かつ本体よりオッズが低い ---
+    def check_blue_neighbor_reverse(row, context_df):
+        my_attrs = str(row['属性'])
+        if '△' not in my_attrs or '青塗隣' not in my_attrs:
+            return False, ""
+        my_num = row['正番']
+        my_odds = pd.to_numeric(row['単ｵｯｽﾞ'], errors='coerce')
+        if pd.isna(my_odds): return False, ""
+
+        race_df = context_df[(context_df['場名'] == row['場名']) & (context_df['R'] == row['R'])]
+        for offset in [-1, 1]:
+            neighbor_num = my_num + offset
+            neighbor_row = race_df[race_df['正番'] == neighbor_num]
+            if neighbor_row.empty: continue
+            
+            n_attrs = str(neighbor_row.iloc[0]['属性'])
+            if '★' in n_attrs and '青塗' in n_attrs:
+                n_odds = pd.to_numeric(neighbor_row.iloc[0]['単ｵｯｽﾞ'], errors='coerce')
+                if pd.notna(n_odds) and my_odds < n_odds:
+                    return True, f"隣({neighbor_num}番)より低オッズ"
+        return False, ""
+
+    # 全走査してフラグ立て
+    future_df = df[pd.to_numeric(df['着順'], errors='coerce').isna()].copy()
+    reverse_flags = []
+    reasons = []
+    for idx, row in future_df.iterrows():
+        is_rev, reason = check_blue_neighbor_reverse(row, full_df)
+        reverse_flags.append(is_rev)
+        reasons.append(reason)
+    future_df['is_blue_reverse'] = reverse_flags
+    future_df['reverse_reason'] = reasons
     
-    target_df = future[
-        ((future['動的ポイント'] > 0) | (future['合計ポイント'] >= 7.0)) &
-        cond_odds & (future['動的ポイント'] >= 0)
+    # 抽出条件
+    cond_special = (future_df['is_blue_reverse'] == True)
+    cond_normal = ((future_df['動的ポイント'] > 0) | (future_df['合計ポイント'] >= 7.0))
+    cond_odds = pd.to_numeric(future_df['単ｵｯｽﾞ'], errors='coerce').fillna(0) <= 49.9
+    cond_alive = (future_df['動的ポイント'] >= 0)
+
+    target_df = future_df[
+        (cond_special | cond_normal) & cond_odds & cond_alive
     ].copy()
     
     if target_df.empty:
         st.info("現在、特選推奨条件に合致する馬はいません。")
         return
 
-    # 2. ランク判定
+    # ランク判定
     def get_rank(row):
-        if row['動的ポイント'] > 0: return "S" # 激熱
+        if row['is_blue_reverse']: return "SS" # 青塗逆転(鉄板)
+        if row['動的ポイント'] > 0: return "S" # 激熱(シーソー)
         if row['合計ポイント'] >= 10.0: return "A" # 本命
         return "B" # 推奨
 
     target_df['ランク'] = target_df.apply(get_rank, axis=1)
 
-    # 3. 買い目生成
+    # 買い目生成
     tickets = []
     for _, row in target_df.iterrows():
         race_df = full_df[(full_df['場名'] == row['場名']) & (full_df['R'] == row['R'])]
         tickets.append(generate_betting_ticket(row, race_df))
     target_df['推奨買い目'] = tickets
 
-    # 4. タブ表示
+    # タブ表示
     places = sorted(target_df['場名'].unique())
     p_tabs = st.tabs(places)
     
@@ -325,20 +356,26 @@ def render_recommendations(full_df):
             
             for r_tab, r_num in zip(r_tabs, races):
                 with r_tab:
-                    rank_map = {"S": 3, "A": 2, "B": 1}
+                    rank_map = {"SS": 4, "S": 3, "A": 2, "B": 1}
                     place_rec_df['rank_num'] = place_rec_df['ランク'].map(rank_map)
                     
                     disp_df = place_rec_df[place_rec_df['R'] == r_num].sort_values(
                         ['rank_num', '合計ポイント'], ascending=[False, False]
                     )
                     
+                    def append_reason(r):
+                        if r['is_blue_reverse']:
+                            return f"🔥{r['reverse_reason']} / " + r['属性']
+                        return r['属性']
+                    disp_df['属性'] = disp_df.apply(append_reason, axis=1)
+                    
                     st.dataframe(
                         disp_df[['ランク', '正番', '馬名', '単ｵｯｽﾞ', '合計ポイント', '動的ポイント', '推奨買い目', '属性']],
                         column_config={
-                            "ランク": st.column_config.TextColumn("ランク", width="small", help="S:激熱(狙い目), A:本命, B:推奨"),
+                            "ランク": st.column_config.TextColumn("ランク", width="small", help="SS:青塗隣逆転, S:シーソー激熱, A:本命"),
                             "正番": st.column_config.NumberColumn("番", width="small", format="%d"),
                             "合計ポイント": st.column_config.ProgressColumn("総合評価", min_value=0, max_value=20, format="%.1f"),
-                            "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f", help="プラス値は直前のペア凡走によるチャンス加点"),
+                            "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f", help="プラスはチャンス"),
                             "推奨買い目": st.column_config.TextColumn("🎫 買い目", width="large"),
                             "属性": st.column_config.TextColumn("根拠", width="medium")
                         },
@@ -362,7 +399,7 @@ def render_main_tabs(full_df):
                 with r_tab:
                     race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
                     
-                    # A. 結果入力
+                    # 結果入力
                     with st.expander("📝 結果入力・修正", expanded=True):
                         c1, c2 = st.columns([3, 1])
                         with c1:
@@ -389,7 +426,7 @@ def render_main_tabs(full_df):
                                 st.session_state['analyzed_df'] = new_df
                                 st.rerun()
 
-                    # B. 分析結果
+                    # 分析チャート
                     st.markdown("##### 📊 分析チャート")
                     disp = race_df.copy()
                     def get_status(row):
@@ -422,16 +459,16 @@ def render_main_tabs(full_df):
 def main():
     st.sidebar.title("🏇 設定・データ")
     
-    # A. 続きから始める場合 (Save/Load)
+    # Save/Load
     st.sidebar.subheader("💾 途中経過の読み込み")
     uploaded_progress = st.sidebar.file_uploader("保存したCSVを読み込む", type=['csv'], key="progress")
     
-    # B. 新規分析の場合
+    # New Analysis
     st.sidebar.subheader("🆕 新規分析")
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
 
-    # ロード処理
+    # データ読み込み処理
     if uploaded_progress:
         try:
             df = pd.read_csv(uploaded_progress)
@@ -462,7 +499,7 @@ def main():
             else:
                 st.error(f"読み込みエラー: {msg1}")
 
-    # メイン表示
+    # メイン画面表示
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
@@ -473,16 +510,17 @@ def main():
             csv,
             "haichi_analysis_save.csv",
             "text/csv",
-            help="現在の状態を保存します"
+            help="現在の状態を保存"
         )
         
-        # 1. 推奨馬表示 (S/A/Bランク・タブ形式)
+        # 1. 推奨馬表示 (SSランク対応版)
         render_recommendations(full_df)
         
-        # 2. 全レース表示 (タブ形式)
+        # 2. 全レース詳細
         render_main_tabs(full_df)
+        
     else:
-        st.info("👈 サイドバーからデータをアップロードしてください。\n(1129全出走馬.csv など)")
+        st.info("👈 サイドバーからデータをアップロードしてください。\n(例: 1129全出走馬.csv)")
 
 if __name__ == "__main__":
     main()
