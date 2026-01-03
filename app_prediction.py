@@ -6,38 +6,29 @@ import re
 # --- 1. 基本設定 & ユーティリティ ---
 st.set_page_config(page_title="配置馬券術AI分析システム", layout="wide")
 
-# ポイント配分設定 (ユーザー要望に合わせて調整)
-# 騎手ペア > 厩舎・馬主青塗 > 厩舎・馬主ペア
+# ポイント配分設定
 HAICHI_POINTS = {
-    # ペア配点
     'pair_jockey': 3.0,          # 騎手ペア (重要)
     'pair_stable_owner': 1.0,    # 厩舎・馬主ペア
-
-    # 青塗本体配点
     'blue_jockey': 4.0,          # 騎手青塗 (最強)
-    'blue_stable_owner': 2.0,    # 厩舎・馬主青塗 (騎手ペアより下)
-
-    # 青塗隣配点
-    'blue_neighbor': 2.0,        # 青塗隣 (基本)
-    'sandwich_bonus': 4.0,       # 青塗サンドイッチ＆低オッズ (二つ分加算)
-
-    # その他
+    'blue_stable_owner': 2.0,    # 厩舎・馬主青塗
+    'blue_neighbor': 2.0,        # 青塗隣
+    'sandwich_bonus': 4.0,       # 青塗サンドイッチ
     'stable_symmetry': 2.0,      # 厩舎対称配置
-    'continuous': 1.0,           # 連続レース配置ボーナス
+    'continuous': 1.0,           # 連続レース配置
     'odds_rank_bonus': 1.0,      # 1~5番人気
     'prev_day_same_fail': 1.0,   # 前日同R同配置で凡走
     'prev_day_same_win': -1.0,   # 前日同R同配置で好走
 }
 
 def to_half_width(text):
-    """全角数字を半角に変換"""
     if pd.isna(text): return text
     text = str(text)
     table = str.maketrans('０１２３４５６７８９．', '0123456789.')
     return re.sub(r'[^\d\.]', '', text.translate(table))
 
 def normalize_name(x):
-    """名前の正規化（修正版：過度なカットを行わない）"""
+    """名前の正規化（スペース削除のみ）"""
     if pd.isna(x): return ''
     s = str(x).strip()
     s = s.replace('　', '').replace(' ', '')
@@ -97,7 +88,7 @@ def load_data(file):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 基本4数字の計算
+    # 基本4数字
     max_umaban = df.groupby(['場名', 'R'])['正番'].transform('max')
     df['頭数'] = max_umaban.fillna(16).astype(int)
     df['逆番'] = (df['頭数'] + 1) - df['正番']
@@ -107,7 +98,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     for c in ['正番', '逆番', '正循環', '逆循環']:
         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
 
-    # 結果格納用
     if '合計ポイント' not in df.columns: df['合計ポイント'] = 0.0
     if '動的ポイント' not in df.columns: df['動的ポイント'] = 0.0
     
@@ -121,9 +111,8 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
 
     idx_map = {(row['場名'], row['R'], row['正番']): i for i, row in df.iterrows()}
 
-    # --- A. 青塗 (Blue Paint) ---
+    # --- A. 青塗 ---
     blue_paint_targets = []
-    
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2: continue
@@ -132,12 +121,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
             
             if common_nums:
                 num_str = list(common_nums)[0]
-                
-                # ポイント配分の切り替え
-                if category == '騎手':
-                    pt = HAICHI_POINTS['blue_jockey']
-                else:
-                    pt = HAICHI_POINTS['blue_stable_owner']
+                pt = HAICHI_POINTS['blue_jockey'] if category == '騎手' else HAICHI_POINTS['blue_stable_owner']
 
                 for _, row in group.iterrows():
                     idx = idx_map.get((row['場名'], row['R'], row['正番']))
@@ -146,63 +130,49 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                         df.at[idx, '属性_list'].append(f"★{category}青塗(No.{num_str})")
                         blue_paint_targets.append({'場名': place, 'R': row['R'], '正番': row['正番'], 'cat': category})
 
-    # --- B. 青塗隣 (Neighbor) & サンドイッチ判定 ---
-    # 青塗マップを作成: (場名, R, 正番) -> {cat, ...}
+    # --- B. 青塗隣 & サンドイッチ ---
     blue_map = {}
     for b in blue_paint_targets:
         key = (b['場名'], b['R'], b['正番'])
         if key not in blue_map: blue_map[key] = []
         blue_map[key].append(b['cat'])
 
-    # 隣加算処理
+    # 隣
     for b in blue_paint_targets:
         for neighbor_num in [b['正番'] - 1, b['正番'] + 1]:
             idx = idx_map.get((b['場名'], b['R'], neighbor_num))
             if idx is not None:
                 current_attrs = df.at[idx, '属性_list']
                 tag = f"△{b['cat']}青塗隣"
-                # 同じカテゴリの青塗隣タグがなければ加算
                 if tag not in current_attrs:
                     df.at[idx, '合計ポイント'] += HAICHI_POINTS['blue_neighbor']
                     df.at[idx, '属性_list'].append(tag)
 
-    # ★サンドイッチ特別判定 (両隣が青塗 かつ オッズが両隣より低い)
+    # サンドイッチ
     for idx, row in df.iterrows():
         my_num = row['正番']
         left_key = (row['場名'], row['R'], my_num - 1)
         right_key = (row['場名'], row['R'], my_num + 1)
         
-        # 両隣が青塗対象かどうか
         if left_key in blue_map and right_key in blue_map:
-            # オッズ確認
             my_odds = pd.to_numeric(row['単ｵｯｽﾞ'], errors='coerce')
-            
-            # 左隣のオッズ
             left_row_idx = idx_map.get(left_key)
-            left_odds = pd.to_numeric(df.at[left_row_idx, '単ｵｯｽﾞ'], errors='coerce') if left_row_idx is not None else np.nan
-            
-            # 右隣のオッズ
             right_row_idx = idx_map.get(right_key)
-            right_odds = pd.to_numeric(df.at[right_row_idx, '単ｵｯｽﾞ'], errors='coerce') if right_row_idx is not None else np.nan
             
-            # 判定: 自分が一番低オッズ(人気)であること
+            left_odds = pd.to_numeric(df.at[left_row_idx, '単ｵｯｽﾞ'], errors='coerce') if left_row_idx else np.nan
+            right_odds = pd.to_numeric(df.at[right_row_idx, '単ｵｯｽﾞ'], errors='coerce') if right_row_idx else np.nan
+            
             if pd.notna(my_odds) and pd.notna(left_odds) and pd.notna(right_odds):
                 if my_odds < left_odds and my_odds < right_odds:
-                    # サンドイッチボーナス加算
                     df.at[idx, '合計ポイント'] += HAICHI_POINTS['sandwich_bonus']
                     df.at[idx, '属性_list'].append("🔥青塗サンドイッチ(好配置)")
 
-    # --- C. ペア & 連続レース ---
+    # --- C. ペア ---
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2: continue
             rows = group.sort_values('R').to_dict('records')
-            
-            # ポイント配分の切り替え
-            if category == '騎手':
-                pt_pair = HAICHI_POINTS['pair_jockey']
-            else:
-                pt_pair = HAICHI_POINTS['pair_stable_owner']
+            pt_pair = HAICHI_POINTS['pair_jockey'] if category == '騎手' else HAICHI_POINTS['pair_stable_owner']
             
             for i in range(len(rows) - 1):
                 r1, r2 = rows[i], rows[i+1]
@@ -223,7 +193,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                             target_r = r2['R'] if r_data['R'] == r1['R'] else r1['R']
                             df.at[idx, 'ペア対象_list'].append({'R': target_r, 'cat': category})
 
-    # --- D. 厩舎対称配置 ---
+    # --- D. 対称 ---
     for (place, r), race_group in df.groupby(['場名', 'R']):
         for stable_name, stable_group in race_group.groupby('厩舎'):
             if len(stable_group) < 2: continue
@@ -241,7 +211,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                         df.at[idx_s, '合計ポイント'] += HAICHI_POINTS['stable_symmetry']
                         df.at[idx_s, '属性_list'].append("◇厩舎対称")
 
-    # --- E. 前日データの横比較 ---
+    # --- E. 前日比較 ---
     if df_prev is not None and not df_prev.empty:
         prev_map = {}
         for _, row in df_prev.iterrows():
@@ -253,14 +223,14 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
             if key in prev_map:
                 prev_rank = prev_map[key]
                 if pd.notna(prev_rank):
-                    if prev_rank > 3: # 凡走
+                    if prev_rank > 3:
                         df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_fail']
                         df.at[idx, '属性_list'].append("★前日同配置(凡走)")
-                    elif prev_rank <= 3: # 好走
+                    elif prev_rank <= 3:
                         df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_win']
                         df.at[idx, '属性_list'].append("▼前日同配置(好走)")
 
-    # --- F. オッズ加点 ---
+    # --- F. 人気加点 ---
     if '単ｵｯｽﾞ' in df.columns:
         df['人気ランク'] = df.groupby(['場名', 'R'])['単ｵｯｽﾞ'].rank(method='min')
         df.loc[df['人気ランク'] <= 5, '合計ポイント'] += HAICHI_POINTS['odds_rank_bonus']
@@ -268,7 +238,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(x))
     return df
 
-# --- 4. 動的ロジック (シーソー/玉突き連動) ---
+# --- 4. 動的ロジック ---
 def update_dynamic_points_chain(df):
     if '着順' not in df.columns: return df
     
@@ -308,69 +278,68 @@ def update_dynamic_points_chain(df):
 
 # --- 5. UIコンポーネント: 厳選レース予報 ---
 def render_race_forecast(full_df):
-    """レース単位で軸馬と相手を厳選して表示"""
     st.markdown("### 🎯 厳選勝負レース (推奨買い目)")
     df = full_df.copy()
     
-    # 未来のレース確認
     future_mask = pd.to_numeric(df['着順'], errors='coerce').isna()
     if not future_mask.any():
         st.info("全てのレースが終了しています。")
         return
 
-    # 青塗逆転の判定ロジック (SS判定用)
+    # SSランク判定: 青塗隣かつオッズ逆転
     def check_blue_reverse(row, context_df):
         my_attrs = str(row.get('属性', ''))
-        # そもそも青塗隣でなければNG
-        if '△' not in my_attrs or '青塗隣' not in my_attrs: return False, False
+        # 属性リストが空なら判定しない（安全策）
+        if not my_attrs or '△' not in my_attrs or '青塗隣' not in my_attrs:
+            return False, False, ""
         
-        # 騎手の青塗隣かどうかをチェック (属性文字列から判断)
         is_jockey_neighbor = '△騎手青塗隣' in my_attrs
-
         my_num = row['正番']
         my_odds = pd.to_numeric(row['単ｵｯｽﾞ'], errors='coerce')
-        if pd.isna(my_odds): return False, False
+        if pd.isna(my_odds): return False, False, ""
         
         race_df = context_df[(context_df['場名'] == row['場名']) & (context_df['R'] == row['R'])]
         
-        # 隣の確認
         for offset in [-1, 1]:
             neighbor_num = my_num + offset
             n_row = race_df[race_df['正番'] == neighbor_num]
             if n_row.empty: continue
             
             n_attrs = str(n_row.iloc[0].get('属性', ''))
-            # 隣が青塗本体か
             if '★' in n_attrs and '青塗' in n_attrs:
                 n_odds = pd.to_numeric(n_row.iloc[0]['単ｵｯｽﾞ'], errors='coerce')
-                # 自分が人気(低オッズ)ならOK
+                # 逆転判定
                 if pd.notna(n_odds) and my_odds < n_odds:
-                    return True, is_jockey_neighbor
+                    neighbor_name = n_row.iloc[0]['馬名']
+                    reason_msg = f"🔥隣の{neighbor_name}(青塗)より人気"
+                    return True, is_jockey_neighbor, reason_msg
                     
-        return False, False
+        return False, False, ""
 
-    # ランク計算
-    def calculate_rank(row, context_df):
+    # ランク計算と根拠の追記
+    def calculate_rank_and_reason(row, context_df):
         odds = pd.to_numeric(row['単ｵｯｽﾞ'], errors='coerce')
-        if pd.isna(odds) or odds > 49.9: return "C"
+        if pd.isna(odds) or odds > 49.9: return "C", row['属性']
+        if row.get('動的ポイント', 0) < 0: return "C", row['属性']
         
-        # 死に目チェック
-        if row.get('動的ポイント', 0) < 0: return "C"
+        is_reverse, is_jockey_origin, reverse_msg = check_blue_reverse(row, context_df)
         
-        # 青塗逆転チェック
-        is_reverse, is_jockey_origin = check_blue_reverse(row, context_df)
+        # 根拠テキストの更新
+        new_reason = row['属性']
         
         if is_reverse:
-            # 騎手由来ならSS、それ以外(厩舎・馬主)ならS
+            new_reason = f"【鉄板法則】{reverse_msg} / " + new_reason
             if is_jockey_origin:
-                return "SS"
+                return "SS", new_reason
             else:
-                return "S"
+                return "S", new_reason # 厩舎・馬主由来はSまで
         
-        if row.get('動的ポイント', 0) > 0: return "S" # シーソー激熱
-        if row.get('合計ポイント', 0) >= 10.0: return "A"
-        if row.get('合計ポイント', 0) >= 7.0: return "B"
-        return "C"
+        if row.get('動的ポイント', 0) > 0:
+            return "S", f"【激熱】直前ペア凡走による連動 / {new_reason}"
+            
+        if row.get('合計ポイント', 0) >= 10.0: return "A", new_reason
+        if row.get('合計ポイント', 0) >= 7.0: return "B", new_reason
+        return "C", new_reason
 
     # レースごとの処理
     places = sorted(df['場名'].unique())
@@ -387,17 +356,19 @@ def render_race_forecast(full_df):
                 
                 if not race_df[pd.to_numeric(race_df['着順'], errors='coerce').isna()].empty:
                     
-                    race_df['ランク'] = race_df.apply(lambda x: calculate_rank(x, df), axis=1)
+                    # ランクと拡張根拠を計算
+                    results = race_df.apply(lambda x: calculate_rank_and_reason(x, df), axis=1)
+                    race_df['ランク'] = [r[0] for r in results]
+                    race_df['拡張根拠'] = [r[1] for r in results]
+                    
                     axis_candidates = race_df[race_df['ランク'].isin(['SS', 'S'])]
                     
                     if not axis_candidates.empty:
                         has_recommendation = True
                         rank_map = {'SS': 3, 'S': 2}
                         axis_candidates['rank_score'] = axis_candidates['ランク'].map(rank_map)
-                        # ソート順: ランク > ポイント
                         axis_horse = axis_candidates.sort_values(['rank_score', '合計ポイント'], ascending=[False, False]).iloc[0]
                         
-                        # 相手選び
                         opponents = race_df[
                             (race_df['正番'] != axis_horse['正番']) &
                             (race_df['動的ポイント'] >= 0) &
@@ -413,7 +384,8 @@ def render_race_forecast(full_df):
                             
                             c1, c2 = st.columns([2, 3])
                             with c1:
-                                st.info(f"**根拠**: {axis_horse['属性']}")
+                                # 拡張された根拠を表示
+                                st.info(f"**根拠**: {axis_horse['拡張根拠']}")
                                 st.write(f"オッズ: **{axis_horse['単ｵｯｽﾞ']}**倍 / スコア: **{axis_horse['合計ポイント']}**")
                             with c2:
                                 st.write("**🎫 推奨買い目**")
@@ -432,7 +404,7 @@ def render_race_forecast(full_df):
         st.info("現在、厳選条件（SS/Sランク）に合致する勝負レースはありません。")
 
 def render_main_tabs(full_df):
-    """メイン画面（全レース表示＆入力）"""
+    """メイン画面"""
     places = sorted(full_df['場名'].unique())
     if not places: return
 
@@ -555,10 +527,7 @@ def main():
             help="現在の状態を保存"
         )
         
-        # 1. 厳選レース予報
         render_race_forecast(full_df)
-        
-        # 2. 全レース詳細
         render_main_tabs(full_df)
         
     else:
