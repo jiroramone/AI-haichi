@@ -26,10 +26,13 @@ def to_half_width(text):
     return re.sub(r'[^\d\.]', '', text.translate(table))
 
 def normalize_name(x):
-    """名前の正規化（空白削除など）"""
+    """名前の正規化（修正版：過度なカットを行わない）"""
     if pd.isna(x): return ''
-    s = str(x).strip().replace('　', '').replace(' ', '')
-    s = re.split(r'[,(（/]', s)[0]
+    s = str(x).strip()
+    # スペースのみ削除
+    s = s.replace('　', '').replace(' ', '')
+    # ※ここで ( や / で区切る処理を廃止しました
+    # 特定の記号のみ削除（★などは属性とかぶるため削除、*は外国馬マークなど）
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
 # --- 2. データ読み込み ---
@@ -74,6 +77,7 @@ def load_data(file):
         df['R'] = df['R'].astype(int)
         df['正番'] = df['正番'].astype(int)
         
+        # 名前系カラムの正規化
         for col in ['騎手', '厩舎', '馬主', '馬名', '場名']:
             df[col] = df[col].apply(normalize_name)
             
@@ -370,7 +374,7 @@ def render_main_tabs(full_df):
                                 race_df[['正番', '馬名', '着順']],
                                 column_config={
                                     "正番": st.column_config.NumberColumn(disabled=True, width="small"),
-                                    "馬名": st.column_config.TextColumn(disabled=True),
+                                    "馬名": st.column_config.TextColumn("馬名", width="medium"), # 幅を広めに設定
                                     "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d")
                                 },
                                 hide_index=True, use_container_width=True, key=f"ed_{place}_{r_num}"
@@ -408,6 +412,7 @@ def render_main_tabs(full_df):
                     st.dataframe(
                         disp[['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', '動的ポイント', '状態', '連動', '属性']],
                         column_config={
+                            "馬名": st.column_config.TextColumn("馬名", width="medium"), # 幅を広めに設定
                             "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20),
                             "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f"),
                             "状態": st.column_config.TextColumn("判定", width="small"),
@@ -469,14 +474,14 @@ def main():
             help="現在の状態を保存"
         )
         
-        # 1. 厳選レース予報 (SS/Sランク軸 + 相手絞り込み)
+        # 1. 厳選レース予報
         render_race_forecast(full_df)
         
         # 2. 全レース詳細
         render_main_tabs(full_df)
         
     else:
-        st.info("👈 サイドバーからデータをアップロードしてください。\n(例: 1129全出走馬.csv)")
+        st.info("👈 サイドバーからデータをアップロードしてください。")
 
 if __name__ == "__main__":
     main()
