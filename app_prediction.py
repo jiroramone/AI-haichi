@@ -8,18 +8,15 @@ st.set_page_config(page_title="配置馬券術AI分析システム", layout="wid
 
 # ポイント配分設定
 HAICHI_POINTS = {
-    # 基礎点
-    'pair_jockey': 3.0,          # 騎手ペア (重要)
+    'pair_jockey': 3.0,          # 騎手ペア
     'pair_stable_owner': 1.0,    # 厩舎・馬主ペア
-    'blue_jockey': 4.0,          # 騎手青塗 (最強)
+    'blue_jockey': 4.0,          # 騎手青塗
     'blue_stable_owner': 2.0,    # 厩舎・馬主青塗
     'blue_neighbor': 2.0,        # 青塗隣
     'sandwich_bonus': 4.0,       # 青塗サンドイッチ
-    'stable_symmetry': 2.0,      # 厩舎対称配置 (本体)
-    'stable_symmetry_neighbor': 2.0, # 厩舎対称配置 (隣)
+    'stable_symmetry': 2.0,      # 厩舎対称配置
+    'stable_symmetry_neighbor': 2.0, # 厩舎対称配置(隣)
     'continuous': 1.0,           # 連続レース配置
-    
-    # 変動点
     'odds_rank_bonus': 1.0,      # 1~5番人気
     'prev_day_same_fail': 1.0,   # 前日同R同配置で凡走
     'prev_day_same_win': -1.0,   # 前日同R同配置で好走
@@ -48,7 +45,6 @@ def load_data(file):
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
-        # ヘッダー行の自動探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -82,9 +78,9 @@ def load_data(file):
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
-        # ★修正: 着順の「0」をNaN（未出走）に変換する処理を追加
+        # キャッシュ作成時にも0を除去
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-        df.loc[df['着順'] == 0, '着順'] = np.nan
+        df.loc[df['着順'] <= 0, '着順'] = np.nan
         
         return df.copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
@@ -129,6 +125,10 @@ def extract_patterns(row):
 
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
+    
+    # 強制クリーニング: 分析直前にも再度0を除去
+    df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
+    df.loc[df['着順'] <= 0, '着順'] = np.nan
     
     max_umaban = df.groupby(['場名', 'R'])['正番'].transform('max')
     df['頭数'] = max_umaban.fillna(16).astype(int)
@@ -244,21 +244,17 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     # --- D. 対称 & 対称隣 ---
     for (place, r), race_group in df.groupby(['場名', 'R']):
         symmetry_targets = []
-        
         for stable_name, stable_group in race_group.groupby('厩舎'):
             if len(stable_group) < 2: continue
-            
             stable_group['正循環'] = stable_group['頭数'] + stable_group['正番']
             stable_group['逆循環'] = stable_group['頭数'] + stable_group['逆番']
             s_rows = stable_group.to_dict('records')
-            
             has_symmetry = False
             for i in range(len(s_rows)):
                 for j in range(i + 1, len(s_rows)):
                     s1 = {s_rows[i]['正番'], s_rows[i]['逆番'], s_rows[i]['正循環'], s_rows[i]['逆循環']}
                     s2 = {s_rows[j]['正番'], s_rows[j]['逆番'], s_rows[j]['正循環'], s_rows[j]['逆循環']}
                     if s1.intersection(s2): has_symmetry = True
-            
             if has_symmetry:
                 for idx_s, row_s in stable_group.iterrows():
                     symmetry_targets.append(row_s['正番'])
@@ -281,7 +277,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
         for _, row in df_prev.iterrows():
             key = (row['R'], row['正番']) 
             prev_map[key] = pd.to_numeric(row['着順'], errors='coerce')
-
         for idx, row in df.iterrows():
             key = (row['R'], row['正番'])
             if key in prev_map:
@@ -305,7 +300,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
 # --- 4. 動的ロジック & トレンド分析 ---
 def calculate_place_trends(df):
     trends = {} 
-    # 修正: 着順が0やNaNでない(確定した)ものだけを集計
     finished = df[pd.notna(pd.to_numeric(df['着順'], errors='coerce'))].copy()
     if finished.empty: return trends
     finished['is_win'] = pd.to_numeric(finished['着順'], errors='coerce') <= 3
@@ -328,7 +322,6 @@ def calculate_place_trends(df):
                     if "隣" in attr: key = "厩舎対称隣"
                     else: key = "厩舎対称"
                 else: continue
-                
                 if key not in attr_stats: attr_stats[key] = {'wins': 0, 'total': 0}
                 attr_stats[key]['total'] += 1
                 if row['is_win']: attr_stats[key]['wins'] += 1
@@ -371,7 +364,6 @@ def update_dynamic_points_chain(df):
     trends = calculate_place_trends(df)
     st.session_state['current_trends'] = trends
     
-    # 修正: 未出走のマスク作成 (0もNaNに変換済みなのでisna()でOK)
     future_mask = pd.isna(pd.to_numeric(df['着順'], errors='coerce'))
     
     for idx in df[future_mask].index:
@@ -419,7 +411,6 @@ def render_race_forecast(full_df):
     st.markdown("### 🎯 厳選勝負レース (推奨買い目)")
     df = full_df.copy()
     
-    # 着順がNaN(または0)のものを未来のレースとする
     future_mask = pd.to_numeric(df['着順'], errors='coerce').isna()
     if not future_mask.any():
         st.info("全てのレースが終了しています。")
@@ -471,9 +462,8 @@ def render_race_forecast(full_df):
         with p_tab:
             place_df = df[df['場名'] == place]
             
-            # --- タブ分けのための事前計算 ---
             target_races = []
-            race_data_map = {} # r_num -> (axis, opponents, str)
+            race_data_map = {} 
 
             all_races = sorted(place_df['R'].unique())
             for r_num in all_races:
@@ -633,7 +623,12 @@ def main():
                 st.error(f"読み込みエラー: {msg1}")
     
     if 'analyzed_df' in st.session_state:
+        # ★強制リセット: メモリ内のデータに対しても「0→NaN」を適用
         full_df = st.session_state['analyzed_df']
+        full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
+        full_df.loc[full_df['着順'] <= 0, '着順'] = np.nan
+        st.session_state['analyzed_df'] = full_df # 更新
+        
         render_trend_sidebar()
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button(
