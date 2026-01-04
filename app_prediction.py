@@ -35,11 +35,10 @@ def normalize_name(x):
     s = s.replace('　', '').replace(' ', '')
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み (強制リセット機能付き) ---
+# --- 2. データ読み込み ---
 @st.cache_data
 def load_data(file):
     try:
-        # A. ファイル読み込み
         if file.name.endswith('.xlsx'):
             xls = pd.ExcelFile(file, engine='openpyxl')
             sheet_names = xls.sheet_names
@@ -53,7 +52,6 @@ def load_data(file):
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
-        # B. ヘッダー自動探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -63,24 +61,20 @@ def load_data(file):
 
         df.columns = df.columns.astype(str).str.strip()
         
-        # C. カラム名の正規化
         name_map = {
             '場所': '場名', '開催': '場名', '競馬場': '場名',
             '調教師': '厩舎', '調教師名': '厩舎', '厩舎名': '厩舎',
             '騎手名': '騎手', 'レース': 'R', 'Ｒ': 'R', '番': '正番', '馬番': '正番',
             '単オッズ': '単ｵｯｽﾞ', '単勝オッズ': '単ｵｯｽﾞ', 'オッズ': '単ｵｯｽﾞ',
-            '着': '着順', '着順': '着順' # 一旦マッピングするが、直後に削除する
+            '着': '着順', '着順': '着順'
         }
         df = df.rename(columns=name_map)
         
-        # D. ★最重要修正: 元ファイルの着順データを完全に無視して削除
+        # 着順データの完全リセット（オッズ差などを読み込まないように削除）
         if '着順' in df.columns:
             df = df.drop(columns=['着順'])
-            
-        # E. 新しく真っ白な「着順」列を作成 (全レース未出走状態にする)
-        df['着順'] = np.nan
+        df['着順'] = np.nan # 新規作成
 
-        # F. 厩舎カラムの自動復旧
         if '厩舎' not in df.columns:
             cols = df.columns.tolist()
             if '斤量' in cols and '馬主' in cols:
@@ -89,13 +83,11 @@ def load_data(file):
                     potential_col = cols[idx_w + 1]
                     df = df.rename(columns={potential_col: '厩舎'})
 
-        # G. 必須カラムの確保
-        ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ']
+        ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ', '着順']
         for col in ensure_cols:
             if col not in df.columns:
                 df[col] = np.nan
 
-        # H. 数値変換とクリーニング
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce')
         df = df.dropna(subset=['R', '正番'])
@@ -149,6 +141,10 @@ def extract_patterns(row):
 
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
+    
+    # 念のためここでもクリーニング
+    df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
+    df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
     max_umaban = df.groupby(['場名', 'R'])['正番'].transform('max')
     df['頭数'] = max_umaban.fillna(16).astype(int)
@@ -569,30 +565,37 @@ def render_main_tabs(full_df):
             for r_tab, r_num in zip(r_tabs, races):
                 with r_tab:
                     race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
+                    
+                    # ★修正: フォーム機能を使って、更新ボタンを押すまでリロードさせない
                     with st.expander("📝 結果入力・修正", expanded=True):
-                        c1, c2 = st.columns([3, 1])
-                        with c1:
-                            if '着順' not in race_df.columns: race_df['着順'] = None
-                            edited = st.data_editor(
-                                race_df[['正番', '馬名', '着順']],
-                                column_config={
-                                    "正番": st.column_config.NumberColumn(disabled=True, width="small"),
-                                    "馬名": st.column_config.TextColumn("馬名", width="medium"),
-                                    "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d")
-                                },
-                                hide_index=True, use_container_width=True, key=f"ed_{place}_{r_num}"
-                            )
-                        with c2:
-                            st.write(""); st.write("")
-                            if st.button("更新", key=f"btn_{place}_{r_num}"):
+                        with st.form(key=f"form_{place}_{r_num}"):
+                            c1, c2 = st.columns([3, 1])
+                            with c1:
+                                if '着順' not in race_df.columns: race_df['着順'] = None
+                                edited = st.data_editor(
+                                    race_df[['正番', '馬名', '着順']],
+                                    column_config={
+                                        "正番": st.column_config.NumberColumn(disabled=True, width="small"),
+                                        "馬名": st.column_config.TextColumn("馬名", width="medium"),
+                                        "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d")
+                                    },
+                                    hide_index=True, use_container_width=True, key=f"ed_{place}_{r_num}"
+                                )
+                            with c2:
+                                st.write(""); st.write("")
+                                submit = st.form_submit_button("更新")
+                            
+                            if submit:
                                 updates = edited.set_index('正番')['着順'].to_dict()
                                 full_current = st.session_state['analyzed_df']
                                 for idx in full_current[(full_current['場名']==place) & (full_current['R']==r_num)].index:
                                     n = full_current.at[idx, '正番']
                                     full_current.at[idx, '着順'] = updates.get(n)
+                                
                                 new_df = update_dynamic_points_chain(full_current)
                                 st.session_state['analyzed_df'] = new_df
                                 st.rerun()
+
                     st.markdown("##### 📊 分析チャート")
                     disp = race_df.copy()
                     def get_status(row):
@@ -630,7 +633,7 @@ def main():
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
     
-    full_df = None
+    full_df = None 
 
     if uploaded_progress:
         try:
@@ -659,6 +662,11 @@ def main():
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
+        # 着順クリーニング
+        full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
+        full_df.loc[(full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
+        st.session_state['analyzed_df'] = full_df 
+        
         st.sidebar.markdown("---")
         if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。"):
             full_df['着順'] = np.nan
@@ -667,6 +675,7 @@ def main():
             st.success("着順データを全てリセットしました！")
             st.rerun()
 
+    # full_dfが存在する場合のみ描画を実行
     if full_df is not None:
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button(
