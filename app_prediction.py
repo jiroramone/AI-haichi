@@ -70,11 +70,7 @@ def load_data(file):
         }
         df = df.rename(columns=name_map)
         
-        # 着順データの完全リセット（オッズ差などを読み込まないように削除）
-        if '着順' in df.columns:
-            df = df.drop(columns=['着順'])
-        df['着順'] = np.nan # 新規作成
-
+        # 厩舎カラム復旧
         if '厩舎' not in df.columns:
             cols = df.columns.tolist()
             if '斤量' in cols and '馬主' in cols:
@@ -98,6 +94,18 @@ def load_data(file):
             df[col] = df[col].apply(normalize_name)
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
+
+        # 着順クリーニング
+        df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
+        is_decimal = (df['着順'] % 1 != 0) & (df['着順'].notna())
+        df.loc[is_decimal, '着順'] = np.nan
+        df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
+
+        # 1着重複チェック
+        if '場名' in df.columns and 'R' in df.columns:
+            for (place, r_num), group in df.groupby(['場名', 'R']):
+                if (group['着順'] == 1).sum() > 1:
+                    df.loc[group.index, '着順'] = np.nan
         
         return df.copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
@@ -142,9 +150,8 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 念のためここでもクリーニング
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-    df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
+    df.loc[(df['着順'] % 1 != 0) | (df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
     max_umaban = df.groupby(['場名', 'R'])['正番'].transform('max')
     df['頭数'] = max_umaban.fillna(16).astype(int)
@@ -483,18 +490,20 @@ def render_race_forecast(full_df):
         if row.get('合計ポイント', 0) >= 7.0: return "B", new_reason
         return "C", new_reason
 
+    # ★修正: タブを廃止し、縦並び（Expander）で表示する形式に変更
     places = sorted(df['場名'].unique())
-    has_recommendation = False
-    p_tabs = st.tabs(places)
+    has_any_recommendation = False
     
-    for p_tab, place in zip(p_tabs, places):
-        with p_tab:
+    # 会場ごとにカラムを分ける
+    p_cols = st.columns(len(places))
+    
+    for col, place in zip(p_cols, places):
+        with col:
+            st.subheader(f"🏟️ {place}")
             place_df = df[df['場名'] == place]
-            target_races = []
-            race_data_map = {} 
-
-            all_races = sorted(place_df['R'].unique())
-            for r_num in all_races:
+            races = sorted(place_df['R'].unique())
+            
+            for r_num in races:
                 race_df = place_df[place_df['R'] == r_num].copy()
                 if race_df[pd.to_numeric(race_df['着順'], errors='coerce').isna()].empty:
                     continue
@@ -504,7 +513,9 @@ def render_race_forecast(full_df):
                 race_df['拡張根拠'] = [r[1] for r in results]
                 
                 axis_candidates = race_df[race_df['ランク'].isin(['SS', 'S'])]
+                
                 if not axis_candidates.empty:
+                    has_any_recommendation = True
                     rank_map = {'SS': 3, 'S': 2}
                     axis_candidates['rank_score'] = axis_candidates['ランク'].map(rank_map)
                     axis_horse = axis_candidates.sort_values(['rank_score', '合計ポイント'], ascending=[False, False]).iloc[0]
@@ -518,39 +529,15 @@ def render_race_forecast(full_df):
                     opp_nums = opponents['正番'].astype(str).tolist()
                     opp_str = ",".join(opp_nums)
                     
-                    target_races.append(r_num)
-                    race_data_map[r_num] = (axis_horse, opp_nums, opp_str)
-                    has_recommendation = True
-
-            if not target_races:
-                st.info("この会場には推奨レースがありません。")
-                continue
-
-            r_tabs = st.tabs([f"{r}R" for r in target_races])
-            for r_tab, r_num in zip(r_tabs, target_races):
-                with r_tab:
-                    axis_horse, opp_nums, opp_str = race_data_map[r_num]
-                    with st.container():
+                    # Expanderで表示（デフォルトで開いておく）
+                    label = f"{r_num}R 【{axis_horse['ランク']}】 {axis_horse['馬名']} (軸)"
+                    with st.expander(label, expanded=True):
                         rank_color = "red" if axis_horse['ランク'] == "SS" else "orange"
-                        st.markdown(f"##### :{rank_color}[【{axis_horse['ランク']}】 {place} {r_num}R] 軸: {axis_horse['正番']} {axis_horse['馬名']} ({axis_horse['騎手']})")
-                        c1, c2 = st.columns([2, 3])
-                        with c1:
-                            st.info(f"**根拠**: {axis_horse['拡張根拠']}")
-                            st.write(f"オッズ: **{axis_horse['単ｵｯｽﾞ']}**倍 / スコア: **{axis_horse['合計ポイント']}**")
-                        with c2:
-                            st.write("**🎫 推奨買い目**")
-                            bets = []
-                            an = axis_horse['正番']
-                            if opp_nums:
-                                bets.append(f"- **ワイド**: {an} － {opp_str}")
-                                if axis_horse['ランク'] == 'SS' or float(axis_horse['単ｵｯｽﾞ']) >= 10:
-                                    bets.append(f"- **3連複**: {an} － {opp_str} (ボーナス)")
-                            else:
-                                bets.append("- 単勝推奨 (相手不在)")
-                            for b in bets: st.write(b)
-                        st.markdown("---")
-
-    if not has_recommendation:
+                        st.markdown(f"**軸**: :{rank_color}[{axis_horse['正番']} {axis_horse['馬名']}] ({axis_horse['騎手']})")
+                        st.caption(f"根拠: {axis_horse['拡張根拠']}")
+                        st.write(f"相手: **{opp_str}**")
+                        
+    if not has_any_recommendation:
         st.info("現在、厳選条件（SS/Sランク）に合致する勝負レースはありません。")
 
 def render_main_tabs(full_df):
@@ -565,37 +552,30 @@ def render_main_tabs(full_df):
             for r_tab, r_num in zip(r_tabs, races):
                 with r_tab:
                     race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
-                    
-                    # ★修正: フォーム機能を使って、更新ボタンを押すまでリロードさせない
                     with st.expander("📝 結果入力・修正", expanded=True):
-                        with st.form(key=f"form_{place}_{r_num}"):
-                            c1, c2 = st.columns([3, 1])
-                            with c1:
-                                if '着順' not in race_df.columns: race_df['着順'] = None
-                                edited = st.data_editor(
-                                    race_df[['正番', '馬名', '着順']],
-                                    column_config={
-                                        "正番": st.column_config.NumberColumn(disabled=True, width="small"),
-                                        "馬名": st.column_config.TextColumn("馬名", width="medium"),
-                                        "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d")
-                                    },
-                                    hide_index=True, use_container_width=True, key=f"ed_{place}_{r_num}"
-                                )
-                            with c2:
-                                st.write(""); st.write("")
-                                submit = st.form_submit_button("更新")
-                            
-                            if submit:
+                        c1, c2 = st.columns([3, 1])
+                        with c1:
+                            if '着順' not in race_df.columns: race_df['着順'] = None
+                            edited = st.data_editor(
+                                race_df[['正番', '馬名', '着順']],
+                                column_config={
+                                    "正番": st.column_config.NumberColumn(disabled=True, width="small"),
+                                    "馬名": st.column_config.TextColumn("馬名", width="medium"),
+                                    "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d")
+                                },
+                                hide_index=True, use_container_width=True, key=f"ed_{place}_{r_num}"
+                            )
+                        with c2:
+                            st.write(""); st.write("")
+                            if st.button("更新", key=f"btn_{place}_{r_num}"):
                                 updates = edited.set_index('正番')['着順'].to_dict()
                                 full_current = st.session_state['analyzed_df']
                                 for idx in full_current[(full_current['場名']==place) & (full_current['R']==r_num)].index:
                                     n = full_current.at[idx, '正番']
                                     full_current.at[idx, '着順'] = updates.get(n)
-                                
                                 new_df = update_dynamic_points_chain(full_current)
                                 st.session_state['analyzed_df'] = new_df
                                 st.rerun()
-
                     st.markdown("##### 📊 分析チャート")
                     disp = race_df.copy()
                     def get_status(row):
@@ -633,7 +613,7 @@ def main():
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
     
-    full_df = None 
+    full_df = None
 
     if uploaded_progress:
         try:
@@ -662,9 +642,8 @@ def main():
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
-        # 着順クリーニング
         full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
-        full_df.loc[(full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
+        full_df.loc[(full_df['着順'] % 1 != 0) | (full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
         st.session_state['analyzed_df'] = full_df 
         
         st.sidebar.markdown("---")
@@ -675,7 +654,6 @@ def main():
             st.success("着順データを全てリセットしました！")
             st.rerun()
 
-    # full_dfが存在する場合のみ描画を実行
     if full_df is not None:
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button(
