@@ -564,31 +564,36 @@ def render_main_tabs(full_df):
                             links.append(f"{icon}{t['R']}R")
                         return " ".join(links)
 
-                    # 表示用データ準備
                     race_df['状態'] = race_df.apply(get_status, axis=1)
                     race_df['連動'] = race_df.apply(get_link, axis=1)
+                    
+                    # 編集対象の列（着順）以外はdisabled=Trueのリストに追加
+                    disabled_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', 
+                                     '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
                     
                     display_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '着順', 
                                     '合計ポイント', '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
                     
+                    # ★修正: フォーム機能を使って、更新ボタンを押すまでリロードさせない
                     with st.form(key=f"form_{place}_{r_num}"):
                         st.caption("👇 **着順** を入力して **更新** ボタンを押すと、分析が再計算されます。")
                         
                         edited = st.data_editor(
                             race_df[display_cols],
+                            disabled=disabled_cols, # これで着順以外は編集不可になる
                             column_config={
-                                "枠番": st.column_config.NumberColumn(width="small", disabled=True),
-                                "正番": st.column_config.NumberColumn(width="small", disabled=True),
-                                "馬名": st.column_config.TextColumn(width="medium", disabled=True),
-                                "騎手": st.column_config.TextColumn(width="small", disabled=True),
-                                "単ｵｯｽﾞ": st.column_config.NumberColumn("オッズ", format="%.1f", disabled=True),
+                                "枠番": st.column_config.NumberColumn(width="small"),
+                                "正番": st.column_config.NumberColumn(width="small"),
+                                "馬名": st.column_config.TextColumn(width="medium"),
+                                "騎手": st.column_config.TextColumn(width="small"),
+                                "単ｵｯｽﾞ": st.column_config.NumberColumn("オッズ", format="%.1f"),
                                 "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d", help="確定した着順を入力"),
-                                "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20, disabled=True),
-                                "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f", disabled=True),
-                                "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f", disabled=True),
-                                "状態": st.column_config.TextColumn("判定", width="small", disabled=True),
-                                "連動": st.column_config.TextColumn("連動", width="small", disabled=True),
-                                "属性": st.column_config.TextColumn("根拠", width="large", disabled=True),
+                                "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20),
+                                "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f"),
+                                "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f"),
+                                "状態": st.column_config.TextColumn("判定", width="small"),
+                                "連動": st.column_config.TextColumn("連動", width="small"),
+                                "属性": st.column_config.TextColumn("根拠", width="large"),
                             },
                             hide_index=True,
                             use_container_width=True,
@@ -646,6 +651,7 @@ def main():
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
+        # 着順クリーニング
         full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
         full_df.loc[(full_df['着順'] % 1 != 0) | (full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
         st.session_state['analyzed_df'] = full_df 
