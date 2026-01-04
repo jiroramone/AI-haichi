@@ -20,7 +20,7 @@ HAICHI_POINTS = {
     'odds_rank_bonus': 1.0,      # 1~5番人気
     'prev_day_same_fail': 1.0,   # 前日同R同配置で凡走
     'prev_day_same_win': -1.0,   # 前日同R同配置で好走
-    'trend_bonus': 2.0,          # トレンド加算
+    'trend_bonus': 2.0,          # トレンド加算 (1つにつき)
 }
 
 def to_half_width(text):
@@ -73,10 +73,10 @@ def load_data(file):
         }
         df = df.rename(columns=name_map)
         
-        # D. 元データの着順を完全無視
+        # D. 元データの着順を完全無視して削除
         if '着順' in df.columns:
             df = df.drop(columns=['着順'])
-        df['着順'] = np.nan 
+        df['着順'] = np.nan # 新規作成(未出走)
 
         # E. 厩舎カラムの自動復旧
         if '厩舎' not in df.columns:
@@ -148,6 +148,7 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
+    # 念のためここでもクリーニング
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
     df.loc[(df['着順'] % 1 != 0) | (df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
@@ -162,6 +163,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
 
     df['パターンリスト'] = df.apply(extract_patterns, axis=1)
 
+    # ポイント初期化
     if '合計ポイント' not in df.columns: df['合計ポイント'] = 0.0
     if '動的ポイント' not in df.columns: df['動的ポイント'] = 0.0
     if 'トレンドポイント' not in df.columns: df['トレンドポイント'] = 0.0
@@ -320,6 +322,10 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
         df['人気ランク'] = df.groupby(['場名', 'R'])['単ｵｯｽﾞ'].rank(method='min')
         df.loc[df['人気ランク'] <= 5, '合計ポイント'] += HAICHI_POINTS['odds_rank_bonus']
 
+    # 静的ポイントを保存（動的計算のベースにするため）
+    df['基礎ポイント'] = df['合計ポイント']
+    
+    # 属性リストを文字列化
     df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(x))
     return df
 
@@ -362,7 +368,19 @@ def calculate_place_trends(df):
 def update_dynamic_points_chain(df):
     if '着順' not in df.columns: return df
     
+    # ★重要: 再計算前にリセット（ポイント・属性）
     df['動的ポイント'] = 0.0
+    df['トレンドポイント'] = 0.0
+    
+    # 基礎ポイントからスタート
+    if '基礎ポイント' in df.columns:
+        df['合計ポイント'] = df['基礎ポイント']
+    
+    # 属性テキストを基礎状態にリセット
+    if '属性_list' in df.columns:
+        df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(x))
+
+    # 1. 激熱（シーソー）ロジック
     bonus_map = {} 
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
@@ -382,11 +400,12 @@ def update_dynamic_points_chain(df):
                 elif not is_finished:
                     if i > 0: bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) + 2.0
                 if is_win: expectation_alive = False
+    
     for idx, bonus in bonus_map.items():
         df.at[idx, '動的ポイント'] += bonus
         df.at[idx, '合計ポイント'] += bonus 
 
-    df['トレンドポイント'] = 0.0
+    # 2. トレンド分析 & 加算
     trends = calculate_place_trends(df)
     st.session_state['current_trends'] = trends
     
@@ -396,6 +415,9 @@ def update_dynamic_points_chain(df):
         place = df.at[idx, '場名']
         attrs = str(df.at[idx, '属性'])
         p_list = df.at[idx, 'パターンリスト']
+        
+        matched_trends = [] # 合致したトレンドをリスト化
+        
         if place in trends:
             for trend_key, data in trends[place].items():
                 is_match = False
@@ -409,11 +431,21 @@ def update_dynamic_points_chain(df):
                 elif trend_key == "厩舎対称隣" and "厩舎対称隣" in attrs: is_match = True
                 
                 if is_match:
-                    if f"📈{trend_key}" not in str(df.at[idx, '属性']):
-                        bonus = HAICHI_POINTS['trend_bonus']
-                        df.at[idx, 'トレンドポイント'] += bonus
-                        df.at[idx, '合計ポイント'] += bonus
-                        df.at[idx, '属性'] = f"📈傾向({trend_key}) / " + df.at[idx, '属性']
+                    matched_trends.append(trend_key)
+        
+        # ★重要: トレンドをまとめて表示・加算
+        if matched_trends:
+            matched_trends = sorted(list(set(matched_trends)))
+            trend_str = ",".join(matched_trends)
+            
+            # 加算 (トレンドの数だけ加算)
+            bonus = len(matched_trends) * HAICHI_POINTS['trend_bonus']
+            df.at[idx, 'トレンドポイント'] = bonus
+            df.at[idx, '合計ポイント'] += bonus
+            
+            # まとめて追記
+            df.at[idx, '属性'] = f"📈傾向({trend_str}) / " + df.at[idx, '属性']
+
     return df
 
 # --- 5. UIコンポーネント ---
@@ -567,20 +599,18 @@ def render_main_tabs(full_df):
                     race_df['状態'] = race_df.apply(get_status, axis=1)
                     race_df['連動'] = race_df.apply(get_link, axis=1)
                     
-                    # 編集対象の列（着順）以外はdisabled=Trueのリストに追加
                     disabled_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', 
                                      '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
                     
                     display_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '着順', 
                                     '合計ポイント', '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
                     
-                    # ★修正: フォーム機能を使って、更新ボタンを押すまでリロードさせない
                     with st.form(key=f"form_{place}_{r_num}"):
                         st.caption("👇 **着順** を入力して **更新** ボタンを押すと、分析が再計算されます。")
                         
                         edited = st.data_editor(
                             race_df[display_cols],
-                            disabled=disabled_cols, # これで着順以外は編集不可になる
+                            disabled=disabled_cols, 
                             column_config={
                                 "枠番": st.column_config.NumberColumn(width="small"),
                                 "正番": st.column_config.NumberColumn(width="small"),
@@ -622,7 +652,7 @@ def main():
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
     
-    full_df = None
+    full_df = None 
 
     if uploaded_progress:
         try:
@@ -674,7 +704,7 @@ def main():
             help="現在の状態を保存"
         )
         
-        # 1. 結果入力 & チャート (最上部へ)
+        # 1. 結果入力 & チャート
         render_main_tabs(full_df)
         
         st.divider()
