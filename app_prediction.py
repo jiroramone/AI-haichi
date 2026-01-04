@@ -509,9 +509,16 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
 def render_sidebar_config():
     st.sidebar.markdown("---")
     st.sidebar.markdown("### ⚙️ 分析設定")
-    with st.sidebar.expander("パラメータ調整", expanded=False):
+    with st.sidebar.expander("パラメータ調整", expanded=True):
         points_config = DEFAULT_POINTS.copy()
-        points_config['pair_jockey'] = st.slider("騎手ペア", 0.0, 10.0, 4.0)
+        
+        # ★ここが新機能: オッズの足切り設定
+        st.caption("🔻 推奨オッズ上限 (これ以上の倍率は除外)")
+        odds_limit = st.slider("推奨足切りオッズ", 10.0, 100.0, 30.0, 5.0, help="このオッズ以上の馬は、どんなに配置が良くてもSS/Sランクにはなりません。")
+        st.session_state['odds_limit'] = odds_limit
+        
+        st.divider()
+        points_config['pair_jockey'] = st.slider("騎手ペア点", 0.0, 10.0, 4.0)
         points_config['trend_bonus'] = st.slider("トレンド加算", 0.0, 5.0, 3.0)
         return points_config
     return DEFAULT_POINTS
@@ -566,6 +573,9 @@ def render_race_forecast(full_df):
         st.info("全レース終了")
         return
 
+    # オッズ制限の取得
+    odds_limit = st.session_state.get('odds_limit', 30.0)
+
     def check_blue_reverse(row, context_df):
         my_attrs = str(row.get('属性', ''))
         if not my_attrs or '△' not in my_attrs or '青塗隣' not in my_attrs:
@@ -589,7 +599,10 @@ def render_race_forecast(full_df):
 
     def calculate_rank_and_reason(row, context_df):
         odds = pd.to_numeric(row['単ｵｯｽﾞ'], errors='coerce')
-        if pd.isna(odds) or odds > 49.9: return "C", row['属性']
+        
+        # ★重要: オッズが上限を超えていたら問答無用で推奨から外す (Bランク以下)
+        if pd.notna(odds) and odds >= odds_limit:
+            return "C", f"【穴除外】オッズ{odds}倍(上限{odds_limit}倍) / " + row['属性']
         
         base_points = row.get('基礎ポイント', 0)
         is_reverse, is_jockey_origin, reverse_msg = check_blue_reverse(row, context_df)
@@ -615,50 +628,47 @@ def render_race_forecast(full_df):
     places = sorted(df['場名'].unique())
     has_any = False
     
-    p_cols = st.columns(len(places))
-    for col, place in zip(p_cols, places):
-        with col:
-            st.subheader(f"🏟️ {place}")
-            place_df = df[df['場名'] == place]
-            races = sorted(place_df['R'].unique())
-            for r_num in races:
-                race_df = place_df[place_df['R'] == r_num].copy()
-                if race_df[pd.to_numeric(race_df['着順'], errors='coerce').isna()].empty:
-                    continue
-                results = race_df.apply(lambda x: calculate_rank_and_reason(x, df), axis=1)
-                race_df['ランク'] = [r[0] for r in results]
-                race_df['拡張根拠'] = [r[1] for r in results]
-                
-                axis_candidates = race_df[race_df['ランク'].isin(['SS', 'S'])]
-                if not axis_candidates.empty:
-                    has_any = True
-                    rank_map = {'SS': 3, 'S': 2}
-                    axis_candidates['rank_score'] = axis_candidates['ランク'].map(rank_map)
-                    axis_horse = axis_candidates.sort_values(['rank_score', '合計ポイント'], ascending=[False, False]).iloc[0]
-                    
-                    opponents = race_df[
-                        (race_df['正番'] != axis_horse['正番']) &
-                        (race_df['動的ポイント'] >= 0) &
-                        ((race_df['合計ポイント'] >= 3.0) | (race_df['人気ランク'] <= 5))
-                    ].sort_values(['合計ポイント', '人気ランク'], ascending=[False, True]).head(4)
-                    
-                    opp_str = ",".join(opponents['正番'].astype(str).tolist())
-                    
-                    label = f"{r_num}R 【{axis_horse['ランク']}】 {axis_horse['馬名']} (軸)"
-                    with st.expander(label, expanded=True):
-                        rank_color = "red" if axis_horse['ランク'] == "SS" else "orange"
-                        st.markdown(f"**軸**: :{rank_color}[{axis_horse['正番']} {axis_horse['馬名']}] ({axis_horse['騎手']})")
-                        st.caption(f"根拠: {axis_horse['拡張根拠']}")
-                        st.write(f"相手: **{opp_str}**")
+    selected_place = st.radio("推奨レースを確認する会場", places, horizontal=True, key="forecast_place")
+    
+    place_df = df[df['場名'] == selected_place]
+    races = sorted(place_df['R'].unique())
+    for r_num in races:
+        race_df = place_df[place_df['R'] == r_num].copy()
+        if race_df[pd.to_numeric(race_df['着順'], errors='coerce').isna()].empty:
+            continue
+        results = race_df.apply(lambda x: calculate_rank_and_reason(x, df), axis=1)
+        race_df['ランク'] = [r[0] for r in results]
+        race_df['拡張根拠'] = [r[1] for r in results]
+        
+        axis_candidates = race_df[race_df['ランク'].isin(['SS', 'S'])]
+        if not axis_candidates.empty:
+            has_any = True
+            rank_map = {'SS': 3, 'S': 2}
+            axis_candidates['rank_score'] = axis_candidates['ランク'].map(rank_map)
+            axis_horse = axis_candidates.sort_values(['rank_score', '合計ポイント'], ascending=[False, False]).iloc[0]
+            
+            opponents = race_df[
+                (race_df['正番'] != axis_horse['正番']) &
+                (race_df['動的ポイント'] >= 0) &
+                ((race_df['合計ポイント'] >= 3.0) | (race_df['人気ランク'] <= 5))
+            ].sort_values(['合計ポイント', '人気ランク'], ascending=[False, True]).head(4)
+            
+            opp_str = ",".join(opponents['正番'].astype(str).tolist())
+            
+            label = f"{r_num}R 【{axis_horse['ランク']}】 {axis_horse['馬名']} (軸)"
+            with st.expander(label, expanded=True):
+                rank_color = "red" if axis_horse['ランク'] == "SS" else "orange"
+                st.markdown(f"**軸**: :{rank_color}[{axis_horse['正番']} {axis_horse['馬名']}] ({axis_horse['騎手']})")
+                st.caption(f"根拠: {axis_horse['拡張根拠']}")
+                st.write(f"相手: **{opp_str}**")
                         
     if not has_any:
-        st.info("推奨馬なし（条件合致せず）")
+        st.info(f"この会場に推奨馬はありません（オッズ{odds_limit}倍以下で条件合致せず）")
 
 def render_main_tabs(full_df, points_config):
     places = sorted(full_df['場名'].unique())
     if not places: return
     
-    # ★修正: タブの入れ子を廃止し、ラジオボタンで会場を選択
     selected_place = st.radio("開催会場を選択", places, horizontal=True)
     
     place_df = full_df[full_df['場名'] == selected_place]
