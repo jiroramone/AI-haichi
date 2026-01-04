@@ -85,7 +85,6 @@ def load_data(file):
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
-        # 着順のクリーニング
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
         df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
         
@@ -160,15 +159,18 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
 
     idx_map = {(row['場名'], row['R'], row['正番']): i for i, row in df.iterrows()}
 
-    # --- 青塗 ---
+    # --- A. 青塗 ---
     blue_paint_targets = []
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2: continue
+            
             group['正循環'] = group['頭数'] + group['正番']
             group['逆循環'] = group['頭数'] + group['逆番']
+            
             sets_list = [{r['正番'], r['逆番'], r['正循環'], r['逆循環']} for _, r in group.iterrows()]
             common_nums = set.intersection(*sets_list)
+            
             if common_nums:
                 num_str = list(common_nums)[0]
                 pt = HAICHI_POINTS['blue_jockey'] if category == '騎手' else HAICHI_POINTS['blue_stable_owner']
@@ -179,7 +181,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                         df.at[idx, '属性_list'].append(f"★{category}青塗(No.{num_str})")
                         blue_paint_targets.append({'場名': place, 'R': row['R'], '正番': row['正番'], 'cat': category})
 
-    # --- 青塗隣 & サンドイッチ ---
+    # --- B. 青塗隣 & サンドイッチ ---
     blue_map = {}
     for b in blue_paint_targets:
         key = (b['場名'], b['R'], b['正番'])
@@ -206,26 +208,32 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
             r_row = idx_map.get(right_key)
             l_odds = pd.to_numeric(df.at[l_row, '単ｵｯｽﾞ'], errors='coerce') if l_row else np.nan
             r_odds = pd.to_numeric(df.at[r_row, '単ｵｯｽﾞ'], errors='coerce') if r_row else np.nan
+            
             if pd.notna(my_odds) and pd.notna(l_odds) and pd.notna(r_odds):
                 if my_odds < l_odds and my_odds < r_odds:
                     df.at[idx, '合計ポイント'] += HAICHI_POINTS['sandwich_bonus']
                     df.at[idx, '属性_list'].append("🔥青塗サンドイッチ(好配置)")
 
-    # --- ペア ---
+    # --- C. ペア ---
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2: continue
+            
             group['正循環'] = group['頭数'] + group['正番']
             group['逆循環'] = group['頭数'] + group['逆番']
             rows = group.sort_values('R').to_dict('records')
+            
             pt_pair = HAICHI_POINTS['pair_jockey'] if category == '騎手' else HAICHI_POINTS['pair_stable_owner']
+            
             for i in range(len(rows) - 1):
                 r1, r2 = rows[i], rows[i+1]
                 patterns = identify_pair_patterns(r1, r2)
+                
                 if patterns:
                     is_continuous = (r2['R'] - r1['R'] == 1)
                     bonus = HAICHI_POINTS['continuous'] if is_continuous else 0
                     pattern_str = ",".join(patterns)
+                    
                     for r_data in [r1, r2]:
                         idx = idx_map.get((r_data['場名'], r_data['R'], r_data['正番']))
                         if idx is not None:
@@ -237,36 +245,50 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                             target_r = r2['R'] if r_data['R'] == r1['R'] else r1['R']
                             df.at[idx, 'ペア対象_list'].append({'R': target_r, 'cat': category})
 
-    # --- 対称 & 対称隣 ---
+    # --- D. 対称 & 対称隣 (厳密化) ---
     for (place, r), race_group in df.groupby(['場名', 'R']):
-        symmetry_targets = []
+        symmetry_targets = set() # 重複しないようにsetを使用
+        
         for stable_name, stable_group in race_group.groupby('厩舎'):
             if len(stable_group) < 2: continue
+            
             stable_group['正循環'] = stable_group['頭数'] + stable_group['正番']
             stable_group['逆循環'] = stable_group['頭数'] + stable_group['逆番']
             s_rows = stable_group.to_dict('records')
-            has_symmetry = False
+            
+            # 対称ペアになっている当事者だけを抽出
+            found_symmetry = False
             for i in range(len(s_rows)):
                 for j in range(i + 1, len(s_rows)):
                     s1 = {s_rows[i]['正番'], s_rows[i]['逆番'], s_rows[i]['正循環'], s_rows[i]['逆循環']}
                     s2 = {s_rows[j]['正番'], s_rows[j]['逆番'], s_rows[j]['正循環'], s_rows[j]['逆循環']}
-                    if s1.intersection(s2): has_symmetry = True
-            if has_symmetry:
+                    
+                    if s1.intersection(s2): 
+                        # マッチした馬の正番を記録
+                        symmetry_targets.add(s_rows[i]['正番'])
+                        symmetry_targets.add(s_rows[j]['正番'])
+                        found_symmetry = True
+            
+            # 当事者にのみタグ付け
+            if found_symmetry:
                 for idx_s, row_s in stable_group.iterrows():
-                    symmetry_targets.append(row_s['正番'])
-                    if "◇厩舎対称" not in df.at[idx_s, '属性_list']:
-                        df.at[idx_s, '合計ポイント'] += HAICHI_POINTS['stable_symmetry']
-                        df.at[idx_s, '属性_list'].append("◇厩舎対称")
+                    if row_s['正番'] in symmetry_targets:
+                        if "◇厩舎対称" not in df.at[idx_s, '属性_list']:
+                            df.at[idx_s, '合計ポイント'] += HAICHI_POINTS['stable_symmetry']
+                            df.at[idx_s, '属性_list'].append("◇厩舎対称")
+
+        # 対称隣への加算
         for sym_num in symmetry_targets:
             for neighbor_num in [sym_num - 1, sym_num + 1]:
                 idx = idx_map.get((place, r, neighbor_num))
                 if idx is not None:
+                    # 自分自身が対象にならないように注意（対称同士が隣り合うケースもあるが加算して良い）
                     tag = "◆厩舎対称隣"
                     if tag not in df.at[idx, '属性_list']:
                         df.at[idx, '合計ポイント'] += HAICHI_POINTS['stable_symmetry_neighbor']
                         df.at[idx, '属性_list'].append(tag)
 
-    # --- 前日比較 ---
+    # --- E. 前日比較 ---
     if df_prev is not None and not df_prev.empty:
         prev_map = {}
         for _, row in df_prev.iterrows():
@@ -284,7 +306,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                         df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_win']
                         df.at[idx, '属性_list'].append("▼前日同配置(好走)")
 
-    # --- 人気加点 ---
+    # --- F. 人気加点 ---
     if '単ｵｯｽﾞ' in df.columns:
         df['人気ランク'] = df.groupby(['場名', 'R'])['単ｵｯｽﾞ'].rank(method='min')
         df.loc[df['人気ランク'] <= 5, '合計ポイント'] += HAICHI_POINTS['odds_rank_bonus']
@@ -329,28 +351,53 @@ def calculate_place_trends(df):
     return trends
 
 def update_dynamic_points_chain(df):
+    """
+    修正版: 未出走のレースには加点しない（フライング激熱の防止）
+    """
     if '着順' not in df.columns: return df
     
     df['動的ポイント'] = 0.0
     bonus_map = {} 
+    
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2: continue
             rows = group.sort_values('R').to_dict('records')
-            expectation_alive = True 
+            
+            # ステータス: 0=未確定/保留, 1=激熱モード(直前が凡走), -1=終了モード(誰かが好走済)
+            chain_status = 0 
+            
             for i in range(len(rows)):
                 curr_row = rows[i]
                 mask = (df['場名'] == curr_row['場名']) & (df['R'] == curr_row['R']) & (df['正番'] == curr_row['正番'])
                 if mask.sum() == 0: continue
                 curr_idx = df[mask].index[0]
+                
                 rank = pd.to_numeric(curr_row['着順'], errors='coerce')
                 is_finished = pd.notna(rank)
                 is_win = is_finished and rank <= 3
-                if not expectation_alive:
+                
+                # --- ポイント適用 ---
+                if chain_status == 1:
+                    # 激熱モードかつ、自分がまだ走っていないなら加点
+                    if not is_finished:
+                        bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) + 2.0
+                elif chain_status == -1:
+                    # もう終わったチェーンなので減点
                     bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) - 2.0
-                elif not is_finished:
-                    if i > 0: bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) + 2.0
-                if is_win: expectation_alive = False
+                
+                # --- 次の馬へのステータス更新 ---
+                if is_win:
+                    chain_status = -1 # 勝ち抜け、終了
+                elif is_finished:
+                    # 凡走確定 -> 次はチャンス (まだ終了モードでなければ)
+                    if chain_status != -1:
+                        chain_status = 1
+                else:
+                    # 未出走 -> 結果不明のためチェーン保留 (次は加点なし)
+                    # ※前の馬が未出走なら、次の馬もまだ待機状態
+                    chain_status = 0
+
     for idx, bonus in bonus_map.items():
         df.at[idx, '動的ポイント'] += bonus
         df.at[idx, '合計ポイント'] += bonus 
@@ -621,12 +668,11 @@ def main():
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
-        # 強制リセット (メモリ上のデータをクリーンアップ)
+        # 強制リセット: メモリ内のデータに対しても「0→NaN」を適用
         full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
         full_df.loc[(full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
         st.session_state['analyzed_df'] = full_df 
         
-        # リセットボタン
         st.sidebar.markdown("---")
         if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。"):
             full_df['着順'] = np.nan
@@ -635,7 +681,7 @@ def main():
             st.success("着順データを全てリセットしました！")
             st.rerun()
 
-    # full_dfが存在する場合のみ描画を実行 (ここが重要)
+    # full_dfが存在する場合のみ描画を実行
     if full_df is not None:
         render_trend_sidebar()
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
