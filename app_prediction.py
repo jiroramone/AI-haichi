@@ -110,7 +110,7 @@ def load_data(file):
         return df.copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
 
-# --- 3. 学習機能 (バックアップ機能強化) ---
+# --- 3. 学習機能 ---
 def load_learning_data():
     if os.path.exists(LEARNING_FILE):
         try:
@@ -595,11 +595,13 @@ def render_race_forecast(full_df):
         is_reverse, is_jockey_origin, reverse_msg = check_blue_reverse(row, context_df)
         new_reason = row['属性']
         
+        # SSランク
         if is_reverse:
             new_reason = f"【鉄板】{reverse_msg} / " + new_reason
             if is_jockey_origin: return "SS", new_reason
             else: return "S", new_reason 
             
+        # Sランク
         if row.get('動的ポイント', 0) > 0:
             if base_points >= 5.0: 
                 return "S", f"【激熱】直前ペア凡走+複合好配置(点数{base_points:.1f}) / {new_reason}"
@@ -655,72 +657,74 @@ def render_race_forecast(full_df):
 def render_main_tabs(full_df, points_config):
     places = sorted(full_df['場名'].unique())
     if not places: return
-    p_tabs = st.tabs(places)
-    for p_tab, place in zip(p_tabs, places):
-        with p_tab:
-            place_df = full_df[full_df['場名'] == place]
-            races = sorted(place_df['R'].unique())
-            r_tabs = st.tabs([f"{r}R" for r in races])
-            for r_tab, r_num in zip(r_tabs, races):
-                with r_tab:
-                    race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
-                    
-                    def get_status(row):
-                        if row['動的ポイント'] > 0: return "🔥激熱"
-                        if row['動的ポイント'] < 0: return "🛑終了"
-                        if row['合計ポイント'] >= 10: return "⭐本命"
-                        return "―"
-                    
-                    def get_link(row):
-                        links = []
-                        for t in row.get('ペア対象_list', []):
-                            icon = "🔙" if t['R'] < row['R'] else "🔜"
-                            links.append(f"{icon}{t['R']}R")
-                        return " ".join(links)
+    
+    # ★修正: タブの入れ子を廃止し、ラジオボタンで会場を選択
+    selected_place = st.radio("開催会場を選択", places, horizontal=True)
+    
+    place_df = full_df[full_df['場名'] == selected_place]
+    races = sorted(place_df['R'].unique())
+    r_tabs = st.tabs([f"{r}R" for r in races])
+    
+    for r_tab, r_num in zip(r_tabs, races):
+        with r_tab:
+            race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
+            
+            def get_status(row):
+                if row['動的ポイント'] > 0: return "🔥激熱"
+                if row['動的ポイント'] < 0: return "🛑終了"
+                if row['合計ポイント'] >= 10: return "⭐本命"
+                return "―"
+            
+            def get_link(row):
+                links = []
+                for t in row.get('ペア対象_list', []):
+                    icon = "🔙" if t['R'] < row['R'] else "🔜"
+                    links.append(f"{icon}{t['R']}R")
+                return " ".join(links)
 
-                    race_df['状態'] = race_df.apply(get_status, axis=1)
-                    race_df['連動'] = race_df.apply(get_link, axis=1)
-                    
-                    disabled_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', 
-                                     '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
-                    
-                    display_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '着順', 
-                                    '合計ポイント', '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
-                    
-                    with st.form(key=f"form_{place}_{r_num}"):
-                        st.caption("👇 着順入力後、更新ボタンを押してください。")
-                        edited = st.data_editor(
-                            race_df[display_cols],
-                            disabled=disabled_cols, 
-                            column_config={
-                                "枠番": st.column_config.NumberColumn(width="small"),
-                                "正番": st.column_config.NumberColumn(width="small"),
-                                "馬名": st.column_config.TextColumn(width="medium"),
-                                "騎手": st.column_config.TextColumn(width="small"),
-                                "単ｵｯｽﾞ": st.column_config.NumberColumn("オッズ", format="%.1f"),
-                                "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d", help="確定した着順を入力"),
-                                "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20),
-                                "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f"),
-                                "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f"),
-                                "状態": st.column_config.TextColumn("判定", width="small"),
-                                "連動": st.column_config.TextColumn("連動", width="small"),
-                                "属性": st.column_config.TextColumn("根拠", width="large"),
-                            },
-                            hide_index=True,
-                            use_container_width=True,
-                            key=f"ed_{place}_{r_num}"
-                        )
-                        
-                        submit = st.form_submit_button("データ更新 & 再計算")
-                        if submit:
-                            updates = edited.set_index('正番')['着順'].to_dict()
-                            full_current = st.session_state['analyzed_df']
-                            for idx in full_current[(full_current['場名']==place) & (full_current['R']==r_num)].index:
-                                n = full_current.at[idx, '正番']
-                                full_current.at[idx, '着順'] = updates.get(n)
-                            new_df = update_dynamic_points_chain(full_current, points_config)
-                            st.session_state['analyzed_df'] = new_df
-                            st.rerun()
+            race_df['状態'] = race_df.apply(get_status, axis=1)
+            race_df['連動'] = race_df.apply(get_link, axis=1)
+            
+            disabled_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', 
+                                '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
+            
+            display_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '着順', 
+                            '合計ポイント', '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
+            
+            with st.form(key=f"form_{selected_place}_{r_num}"):
+                st.caption("👇 着順入力後、更新ボタンを押してください。")
+                edited = st.data_editor(
+                    race_df[display_cols],
+                    disabled=disabled_cols, 
+                    column_config={
+                        "枠番": st.column_config.NumberColumn(width="small"),
+                        "正番": st.column_config.NumberColumn(width="small"),
+                        "馬名": st.column_config.TextColumn(width="medium"),
+                        "騎手": st.column_config.TextColumn(width="small"),
+                        "単ｵｯｽﾞ": st.column_config.NumberColumn("オッズ", format="%.1f"),
+                        "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d", help="確定した着順を入力"),
+                        "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20),
+                        "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f"),
+                        "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f"),
+                        "状態": st.column_config.TextColumn("判定", width="small"),
+                        "連動": st.column_config.TextColumn("連動", width="small"),
+                        "属性": st.column_config.TextColumn("根拠", width="large"),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f"ed_{selected_place}_{r_num}"
+                )
+                
+                submit = st.form_submit_button("データ更新 & 再計算")
+                if submit:
+                    updates = edited.set_index('正番')['着順'].to_dict()
+                    full_current = st.session_state['analyzed_df']
+                    for idx in full_current[(full_current['場名']==selected_place) & (full_current['R']==r_num)].index:
+                        n = full_current.at[idx, '正番']
+                        full_current.at[idx, '着順'] = updates.get(n)
+                    new_df = update_dynamic_points_chain(full_current, points_config)
+                    st.session_state['analyzed_df'] = new_df
+                    st.rerun()
 
 # --- 7. メイン処理フロー ---
 def main():
@@ -763,6 +767,7 @@ def main():
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
+        # 強制リセット
         full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
         full_df.loc[(full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
         st.session_state['analyzed_df'] = full_df 
