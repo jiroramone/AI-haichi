@@ -10,12 +10,27 @@ st.set_page_config(page_title="配置馬券術AI分析システム", layout="wid
 
 LEARNING_FILE = "haichi_learning_data.csv"
 
-# ★正確な2025年度リーディング上位15名 (勝利数順)
-LEADING_JOCKEYS = [
-    "ルメール", "戸崎圭太", "松山弘平", "横山武史", "坂井瑠星", 
-    "川田将雅", "丹内祐次", "岩田望来", "佐々木大輔", "横山和生",
-    "菅原明良", "三浦皇成", "津村明秀", "田辺裕信", "鮫島克駿"
+# --- 2025年JRAリーディング確定版データ ---
+# 1. SS級 (年間100勝以上・絶対王者クラス) -> 場所問わず大幅加点
+JOCKEYS_SS = [
+    "ルメール", "戸崎圭太", "松山弘平", "横山武史", "坂井瑠星", "川田将雅"
 ]
+
+# 2. 関東上位 (美浦所属の好調騎手) -> 関東会場で加点
+JOCKEYS_KANTO = [
+    "丹内祐次", "佐々木大輔", "横山和生", "菅原明良", 
+    "三浦皇成", "津村明秀", "横山典弘", "田辺裕信"
+]
+
+# 3. 関西上位 (栗東所属の好調騎手) -> 関西会場で加点
+JOCKEYS_KANSAI = [
+    "岩田望来", "高杉吏麒", "北村友一", "武豊", 
+    "団野大成", "鮫島克駿", "吉村誠之助", "荻野極", "西村淳也"
+]
+
+# 会場定義
+PLACE_KANTO = ['中山', '東京', '福島', '新潟']
+PLACE_KANSAI = ['京都', '阪神', '中京', '小倉', '札幌', '函館'] 
 
 # ポイント配分設定
 DEFAULT_POINTS = {
@@ -84,8 +99,7 @@ def load_data(file):
         }
         df = df.rename(columns=name_map)
         
-        if '着順' in df.columns:
-            df = df.drop(columns=['着順'])
+        if '着順' in df.columns: df = df.drop(columns=['着順'])
         df['着順'] = np.nan 
 
         if '厩舎' not in df.columns:
@@ -101,8 +115,7 @@ def load_data(file):
 
         ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ']
         for col in ensure_cols:
-            if col not in df.columns:
-                df[col] = np.nan
+            if col not in df.columns: df[col] = np.nan
 
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce')
@@ -275,14 +288,30 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
 
     idx_map = {(row['場名'], row['R'], row['正番']): i for i, row in df.iterrows()}
 
-    # ★リーディング騎手チェック
+    # ★リーディング騎手チェック (地域別)
     for idx, row in df.iterrows():
         jockey_name = str(row['騎手'])
-        # 部分一致で判定
-        is_leading = any(lj in jockey_name for lj in LEADING_JOCKEYS)
-        if is_leading:
+        place_name = str(row['場名'])
+        
+        is_bonus = False
+        leading_type = ""
+
+        # 1. SS級 (どこでも)
+        if any(j in jockey_name for j in JOCKEYS_SS):
+            is_bonus = True
+            leading_type = "SS"
+        # 2. 関東 (関東会場のみ)
+        elif place_name in PLACE_KANTO and any(j in jockey_name for j in JOCKEYS_KANTO):
+            is_bonus = True
+            leading_type = "関東"
+        # 3. 関西 (関西会場のみ)
+        elif place_name in PLACE_KANSAI and any(j in jockey_name for j in JOCKEYS_KANSAI):
+            is_bonus = True
+            leading_type = "関西"
+
+        if is_bonus:
             df.at[idx, '合計ポイント'] += points_config['leading_jockey_bonus']
-            df.at[idx, '属性_list'].append("👑リーディング騎手")
+            df.at[idx, '属性_list'].append(f"👑リーディング({leading_type})")
 
     # --- A. 青塗 ---
     blue_paint_targets = []
@@ -352,6 +381,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
                 if patterns:
                     is_continuous = (abs(r2['R'] - r1['R']) == 1)
                     bonus = points_config['continuous'] if is_continuous else 0
+                    
                     pattern_str = ",".join(patterns)
                     
                     for r_data in [r1, r2]:
@@ -541,7 +571,6 @@ def render_sidebar_config():
         
         st.divider()
         points_config['pair_jockey'] = st.slider("騎手ペア点", 0.0, 10.0, 4.0)
-        points_config['trend_bonus'] = st.slider("トレンド加算", 0.0, 5.0, 3.0)
         points_config['leading_jockey_bonus'] = st.slider("リーディング騎手加算", 0.0, 5.0, 2.0)
         return points_config
     return DEFAULT_POINTS
@@ -636,7 +665,7 @@ def render_race_forecast(full_df):
             
         # Sランク
         if row.get('動的ポイント', 0) > 0:
-            if base_points >= 5.0: 
+            if base_points >= 6.0: 
                 return "S", f"【激熱】直前ペア凡走+複合好配置(点数{base_points:.1f}) / {new_reason}"
             else:
                 return "B", f"【注】直前ペア凡走(単独) / {new_reason}" 
@@ -648,6 +677,7 @@ def render_race_forecast(full_df):
     places = sorted(df['場名'].unique())
     has_any = False
     
+    # 安定化のためラジオボタン
     selected_place = st.radio("推奨レースを確認する会場", places, horizontal=True, key="forecast_place")
     
     place_df = df[df['場名'] == selected_place]
@@ -689,13 +719,13 @@ def render_main_tabs(full_df, points_config):
     places = sorted(full_df['場名'].unique())
     if not places: return
     
+    # ラジオボタンで会場とレースを選択 (タブは廃止して軽量化)
     selected_place = st.radio("開催会場", places, horizontal=True, key="main_place_select")
     place_df = full_df[full_df['場名'] == selected_place]
     
     st.write("---")
     
     races = sorted(place_df['R'].unique())
-    # ★修正: ラジオボタンに変更して軽量化
     selected_race = st.radio("レースを選択", races, horizontal=True, format_func=lambda x: f"{x}R", key="main_race_select")
     
     r_num = selected_race
