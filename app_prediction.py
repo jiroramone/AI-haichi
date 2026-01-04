@@ -3,25 +3,29 @@ import pandas as pd
 import numpy as np
 import re
 import itertools
+import os
 
 # --- 1. 基本設定 & ユーティリティ ---
 st.set_page_config(page_title="配置馬券術AI分析システム", layout="wide")
 
-# ポイント配分設定
-HAICHI_POINTS = {
-    'pair_jockey': 3.0,          # 騎手ペア
-    'pair_stable_owner': 1.0,    # 厩舎・馬主ペア
-    'blue_jockey': 4.0,          # 騎手青塗
-    'blue_stable_owner': 2.0,    # 厩舎・馬主青塗
-    'blue_neighbor': 2.0,        # 青塗隣
-    'sandwich_bonus': 4.0,       # 青塗サンドイッチ
-    'stable_symmetry': 2.0,      # 厩舎対称配置
-    'stable_symmetry_neighbor': 2.0, # 厩舎対称配置(隣)
-    'continuous': 1.0,           # 連続レース配置
-    'odds_rank_bonus': 1.0,      # 1~5番人気
-    'prev_day_same_fail': 1.0,   # 前日同R同配置で凡走
-    'prev_day_same_win': -1.0,   # 前日同R同配置で好走
-    'trend_bonus': 2.0,          # トレンド加算
+LEARNING_FILE = "haichi_learning_data.csv"
+
+# デフォルト設定
+DEFAULT_POINTS = {
+    'pair_jockey': 4.0,
+    'pair_stable_owner': 0.5,
+    'blue_jockey': 5.0,
+    'blue_stable_owner': 1.0,
+    'blue_neighbor': 2.0,
+    'sandwich_bonus': 5.0,
+    'stable_symmetry': 1.0,
+    'stable_symmetry_neighbor': 1.0,
+    'continuous': 2.0,
+    'odds_rank_bonus': 1.0,
+    'prev_day_same_fail': 2.0,
+    'prev_day_same_win': -2.0,
+    'trend_bonus': 3.0,
+    'learning_bonus': 3.0 # 学習データからのボーナス
 }
 
 def to_half_width(text):
@@ -34,10 +38,10 @@ def normalize_name(x):
     if pd.isna(x): return ''
     s = str(x).strip()
     s = s.replace('　', '').replace(' ', '')
-    s = re.split(r'[\(（]', s)[0] # 所属などを削除
+    s = re.split(r'[\(（]', s)[0]
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み (位置補正機能強化版) ---
+# --- 2. データ読み込み ---
 @st.cache_data
 def load_data(file):
     try:
@@ -54,7 +58,7 @@ def load_data(file):
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
-        # ヘッダー自動探索
+        # ヘッダー探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -74,33 +78,21 @@ def load_data(file):
         df = df.rename(columns=name_map)
         
         # 着順リセット
-        if '着順' in df.columns:
-            df = df.drop(columns=['着順'])
+        if '着順' in df.columns: df = df.drop(columns=['着順'])
         df['着順'] = np.nan 
 
-        # ★重要: 列位置による騎手・厩舎の特定
-        # ヘッダーが「斤量」しかなく、その周辺に名前がある場合に対応
-        if '斤量' in df.columns:
-            col_list = df.columns.tolist()
-            idx_w = col_list.index('斤量')
-            
-            # 騎手: 斤量の2つ左 (例: 性齢, [騎手], 関連, 斤量)
-            if '騎手' not in df.columns and idx_w - 2 >= 0:
-                potential_jockey = col_list[idx_w - 2]
-                df = df.rename(columns={potential_jockey: '騎手'})
-            
-            # 厩舎: 斤量の1つ右 (例: 斤量, [厩舎], 関連)
-            if '厩舎' not in df.columns and idx_w + 1 < len(col_list):
-                potential_stable = col_list[idx_w + 1]
-                df = df.rename(columns={potential_stable: '厩舎'})
+        # 厩舎・騎手補正
+        if '厩舎' not in df.columns:
+            cols = df.columns.tolist()
+            if '斤量' in cols:
+                idx_w = cols.index('斤量')
+                if idx_w + 1 < len(cols): df = df.rename(columns={cols[idx_w + 1]: '厩舎'})
+                if idx_w - 2 >= 0 and '騎手' not in df.columns: df = df.rename(columns={cols[idx_w - 2]: '騎手'})
 
-        # 必須カラム確保
         ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ']
         for col in ensure_cols:
-            if col not in df.columns:
-                df[col] = np.nan
+            if col not in df.columns: df[col] = np.nan
 
-        # 数値変換
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce')
         df = df.dropna(subset=['R', '正番'])
@@ -115,7 +107,104 @@ def load_data(file):
         return df.copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
 
-# --- 3. 分析エンジン ---
+# --- 3. 学習機能 ---
+def load_learning_data():
+    if os.path.exists(LEARNING_FILE):
+        return pd.read_csv(LEARNING_FILE)
+    return pd.DataFrame(columns=['場名', 'パターン', '着順', '日付'])
+
+def save_learning_data(current_df):
+    # 確定したレース（着順が入っているもの）のみ抽出
+    finished = current_df[pd.notna(pd.to_numeric(current_df['着順'], errors='coerce'))].copy()
+    if finished.empty:
+        return 0
+    
+    # 必要なデータを抽出して整形
+    learning_rows = []
+    for _, row in finished.iterrows():
+        # 属性リストからパターンを抽出
+        attrs = str(row['属性']).split(' / ')
+        for attr in attrs:
+            # パターン、青塗、対称などのキーワードを含む属性を保存
+            if any(k in attr for k in ['ペア', '青塗', '対称']):
+                # シンプルなキーに変換 (例: "○騎手ペア(12R:A)" -> "騎手ペアA")
+                key = attr
+                if 'ペア' in attr:
+                    match = re.search(r'ペア\((.*)\)', attr)
+                    if match: key = f"ペア_{match.group(1).split(':')[-1]}" # 12R:A -> A
+                elif '青塗' in attr:
+                    if '騎手' in attr: key = '騎手青塗'
+                    elif '厩舎' in attr: key = '厩舎青塗'
+                    elif '隣' in attr: key = '青塗隣'
+                elif '対称' in attr:
+                    if '隣' in attr: key = '対称隣'
+                    else: key = '対称'
+                
+                learning_rows.append({
+                    '場名': row['場名'],
+                    'パターン': key,
+                    '着順': row['着順'],
+                    '日付': pd.Timestamp.now().strftime('%Y-%m-%d')
+                })
+    
+    if not learning_rows:
+        return 0
+
+    new_data = pd.DataFrame(learning_rows)
+    
+    # 既存データとマージ
+    if os.path.exists(LEARNING_FILE):
+        old_data = pd.read_csv(LEARNING_FILE)
+        combined = pd.concat([old_data, new_data]).drop_duplicates()
+    else:
+        combined = new_data
+        
+    combined.to_csv(LEARNING_FILE, index=False)
+    return len(new_data)
+
+def get_learning_bonus(df, points_config):
+    """学習データに基づいてボーナス点を計算"""
+    learning_df = load_learning_data()
+    if learning_df.empty:
+        return df
+    
+    # パターンごとの複勝率(3着内率)を計算
+    learning_df['is_fukusho'] = pd.to_numeric(learning_df['着順'], errors='coerce') <= 3
+    stats = learning_df.groupby(['場名', 'パターン'])['is_fukusho'].agg(['mean', 'count'])
+    
+    # 信頼できるデータ（試行回数5回以上、複勝率40%以上）を抽出
+    strong_patterns = stats[(stats['count'] >= 5) & (stats['mean'] >= 0.4)]
+    
+    if strong_patterns.empty:
+        return df
+
+    # ボーナス適用
+    for idx, row in df.iterrows():
+        place = row['場名']
+        attrs = str(row['属性'])
+        
+        bonus = 0
+        matched_Strong_patterns = []
+        
+        for (p_place, p_pattern), stat in strong_patterns.iterrows():
+            if p_place == place:
+                # 属性テキスト内にパターンが含まれているか簡易チェック
+                check_key = ""
+                if "ペア_" in p_pattern: check_key = p_pattern.split("_")[1] # A, B...
+                elif "青塗" in p_pattern: check_key = "青塗"
+                elif "対称" in p_pattern: check_key = "対称"
+                
+                if check_key and check_key in attrs:
+                    bonus += points_config['learning_bonus']
+                    matched_Strong_patterns.append(f"{p_pattern}({int(stat['mean']*100)}%)")
+        
+        if bonus > 0:
+            df.at[idx, '合計ポイント'] += bonus
+            df.at[idx, '属性'] = f"🎓学習({','.join(matched_Strong_patterns)}) / " + df.at[idx, '属性']
+            
+    return df
+
+# --- 4. 分析エンジン ---
 def identify_pair_patterns(r1, r2):
     patterns = []
     s1, s2 = r1['正番'], r2['正番']
@@ -152,9 +241,10 @@ def extract_patterns(row):
             found_patterns.add(s_val)
     return list(found_patterns)
 
-def analyze_haichi_advanced(df_curr, df_prev=None):
+def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS):
     df = df_curr.copy()
     
+    # クリーニング
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
     df.loc[(df['着順'] % 1 != 0) | (df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
@@ -196,7 +286,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
             
             if common_nums:
                 num_str = list(common_nums)[0]
-                pt = HAICHI_POINTS['blue_jockey'] if category == '騎手' else HAICHI_POINTS['blue_stable_owner']
+                pt = points_config['blue_jockey'] if category == '騎手' else points_config['blue_stable_owner']
                 for _, row in group.iterrows():
                     idx = idx_map.get((row['場名'], row['R'], row['正番']))
                     if idx is not None:
@@ -218,7 +308,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                 current_attrs = df.at[idx, '属性_list']
                 tag = f"△{b['cat']}青塗隣"
                 if tag not in current_attrs:
-                    df.at[idx, '合計ポイント'] += HAICHI_POINTS['blue_neighbor']
+                    df.at[idx, '合計ポイント'] += points_config['blue_neighbor']
                     df.at[idx, '属性_list'].append(tag)
 
     for idx, row in df.iterrows():
@@ -231,57 +321,49 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
             r_row = idx_map.get(right_key)
             l_odds = pd.to_numeric(df.at[l_row, '単ｵｯｽﾞ'], errors='coerce') if l_row else np.nan
             r_odds = pd.to_numeric(df.at[r_row, '単ｵｯｽﾞ'], errors='coerce') if r_row else np.nan
-            
             if pd.notna(my_odds) and pd.notna(l_odds) and pd.notna(r_odds):
                 if my_odds < l_odds and my_odds < r_odds:
-                    df.at[idx, '合計ポイント'] += HAICHI_POINTS['sandwich_bonus']
+                    df.at[idx, '合計ポイント'] += points_config['sandwich_bonus']
                     df.at[idx, '属性_list'].append("🔥青塗サンドイッチ(好配置)")
 
-    # --- C. ペア (連続騎乗のみ) ---
+    # --- C. ペア ---
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2 or name == '': continue
-            
-            group['正循環'] = group['頭数'] + group['正番']
-            group['逆循環'] = group['頭数'] + group['逆番']
             rows = group.sort_values('R').to_dict('records')
             
-            pt_pair = HAICHI_POINTS['pair_jockey'] if category == '騎手' else HAICHI_POINTS['pair_stable_owner']
+            pt_pair = points_config['pair_jockey'] if category == '騎手' else points_config['pair_stable_owner']
             
-            # 隣り合うレース(ソート済)のみを比較
             for i in range(len(rows) - 1):
                 r1, r2 = rows[i], rows[i+1]
                 patterns = identify_pair_patterns(r1, r2)
                 
                 if patterns:
                     is_continuous = (abs(r2['R'] - r1['R']) == 1)
-                    bonus = HAICHI_POINTS['continuous'] if is_continuous else 0
+                    bonus = points_config['continuous'] if is_continuous else 0
                     pattern_str = ",".join(patterns)
                     
                     for r_data in [r1, r2]:
                         idx = idx_map.get((r_data['場名'], r_data['R'], r_data['正番']))
                         if idx is not None:
-                            tag = f"○{category}ペア({pattern_str})" + ("(連続)" if is_continuous else "")
+                            target_r = r2['R'] if r_data['R'] == r1['R'] else r1['R']
+                            tag = f"○{category}ペア({target_r}R:{pattern_str})" + ("(連)" if is_continuous else "")
                             current_list = df.at[idx, '属性_list']
                             if not any(f"○{category}ペア" in x for x in current_list):
                                 df.at[idx, '合計ポイント'] += pt_pair + bonus
                                 df.at[idx, '属性_list'].append(tag)
-                            
-                            target_r = r2['R'] if r_data['R'] == r1['R'] else r1['R']
                             existing_targets = [t['R'] for t in df.at[idx, 'ペア対象_list']]
                             if target_r not in existing_targets:
                                 df.at[idx, 'ペア対象_list'].append({'R': target_r, 'cat': category})
 
-    # --- D. 対称 & 対称隣 ---
+    # --- D. 対称 ---
     for (place, r), race_group in df.groupby(['場名', 'R']):
         symmetry_targets = set()
         for stable_name, stable_group in race_group.groupby('厩舎'):
             if len(stable_group) < 2 or stable_name == '': continue
-            
             stable_group['正循環'] = stable_group['頭数'] + stable_group['正番']
             stable_group['逆循環'] = stable_group['頭数'] + stable_group['逆番']
             s_rows = stable_group.to_dict('records')
-            
             found_symmetry = False
             for i in range(len(s_rows)):
                 for j in range(i + 1, len(s_rows)):
@@ -291,21 +373,19 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                         symmetry_targets.add(s_rows[i]['正番'])
                         symmetry_targets.add(s_rows[j]['正番'])
                         found_symmetry = True
-            
             if found_symmetry:
                 for idx_s, row_s in stable_group.iterrows():
                     if row_s['正番'] in symmetry_targets:
                         if "◇厩舎対称" not in df.at[idx_s, '属性_list']:
-                            df.at[idx_s, '合計ポイント'] += HAICHI_POINTS['stable_symmetry']
+                            df.at[idx_s, '合計ポイント'] += points_config['stable_symmetry']
                             df.at[idx_s, '属性_list'].append("◇厩舎対称")
-
         for sym_num in symmetry_targets:
             for neighbor_num in [sym_num - 1, sym_num + 1]:
                 idx = idx_map.get((place, r, neighbor_num))
                 if idx is not None:
                     tag = "◆厩舎対称隣"
                     if tag not in df.at[idx, '属性_list']:
-                        df.at[idx, '合計ポイント'] += HAICHI_POINTS['stable_symmetry_neighbor']
+                        df.at[idx, '合計ポイント'] += points_config['stable_symmetry_neighbor']
                         df.at[idx, '属性_list'].append(tag)
 
     # --- E. 前日比較 ---
@@ -320,22 +400,25 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                 prev_rank = prev_map[key]
                 if pd.notna(prev_rank):
                     if prev_rank > 3:
-                        df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_fail']
+                        df.at[idx, '合計ポイント'] += points_config['prev_day_same_fail']
                         df.at[idx, '属性_list'].append("★前日同配置(凡走)")
                     elif prev_rank <= 3:
-                        df.at[idx, '合計ポイント'] += HAICHI_POINTS['prev_day_same_win']
+                        df.at[idx, '合計ポイント'] += points_config['prev_day_same_win']
                         df.at[idx, '属性_list'].append("▼前日同配置(好走)")
 
     # --- F. 人気加点 ---
     if '単ｵｯｽﾞ' in df.columns:
         df['人気ランク'] = df.groupby(['場名', 'R'])['単ｵｯｽﾞ'].rank(method='min')
-        df.loc[df['人気ランク'] <= 5, '合計ポイント'] += HAICHI_POINTS['odds_rank_bonus']
+        df.loc[df['人気ランク'] <= 5, '合計ポイント'] += points_config['odds_rank_bonus']
+
+    # ★AI学習ボーナスの適用★
+    df = get_learning_bonus(df, points_config)
 
     df['基礎ポイント'] = df['合計ポイント']
     df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(x))
     return df
 
-# --- 4. 動的ロジック & トレンド分析 ---
+# --- 4. 動的ロジック & トレンド ---
 def calculate_place_trends(df):
     trends = {} 
     finished = df[pd.notna(pd.to_numeric(df['着順'], errors='coerce'))].copy()
@@ -371,7 +454,7 @@ def calculate_place_trends(df):
                     trends[place][key] = {'rate': rate, 'count': stat['total']}
     return trends
 
-def update_dynamic_points_chain(df):
+def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
     if '着順' not in df.columns: return df
     
     df['動的ポイント'] = 0.0
@@ -381,7 +464,6 @@ def update_dynamic_points_chain(df):
     if '属性_list' in df.columns:
         df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(x))
 
-    # 1. 激熱ロジック
     bonus_map = {} 
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
@@ -406,12 +488,10 @@ def update_dynamic_points_chain(df):
         df.at[idx, '動的ポイント'] += bonus
         df.at[idx, '合計ポイント'] += bonus 
 
-    # 2. トレンド分析
     trends = calculate_place_trends(df)
     st.session_state['current_trends'] = trends
     
     future_mask = pd.isna(pd.to_numeric(df['着順'], errors='coerce'))
-    
     for idx in df[future_mask].index:
         place = df.at[idx, '場名']
         attrs = str(df.at[idx, '属性'])
@@ -432,7 +512,7 @@ def update_dynamic_points_chain(df):
         if matched_trends:
             matched_trends = sorted(list(set(matched_trends)))
             trend_str = ",".join(matched_trends)
-            bonus = len(matched_trends) * HAICHI_POINTS['trend_bonus']
+            bonus = len(matched_trends) * points_config['trend_bonus']
             df.at[idx, 'トレンドポイント'] = bonus
             df.at[idx, '合計ポイント'] += bonus
             df.at[idx, '属性'] = f"📈傾向({trend_str}) / " + df.at[idx, '属性']
@@ -440,6 +520,33 @@ def update_dynamic_points_chain(df):
     return df
 
 # --- 5. UIコンポーネント ---
+def render_sidebar_config():
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### ⚙️ 分析パラメータ調整")
+    with st.sidebar.expander("詳細設定を開く"):
+        points_config = DEFAULT_POINTS.copy()
+        points_config['pair_jockey'] = st.slider("騎手ペア", 0.0, 10.0, 4.0)
+        points_config['blue_jockey'] = st.slider("騎手青塗", 0.0, 10.0, 5.0)
+        points_config['sandwich_bonus'] = st.slider("サンドイッチ", 0.0, 10.0, 5.0)
+        points_config['trend_bonus'] = st.slider("トレンド加算", 0.0, 5.0, 3.0)
+        points_config['learning_bonus'] = st.slider("学習データ加算", 0.0, 5.0, 3.0)
+        return points_config
+    return DEFAULT_POINTS
+
+def render_learning_section(full_df):
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧠 AI学習機能")
+    if st.sidebar.button("💾 現在の結果を学習データに保存", help="確定した着順データを蓄積し、次回の精度を上げます。"):
+        count = save_learning_data(full_df)
+        if count > 0:
+            st.sidebar.success(f"{count}件のデータを学習しました！")
+        else:
+            st.sidebar.warning("確定したレース結果がありません。")
+            
+    if os.path.exists(LEARNING_FILE):
+        df_learn = pd.read_csv(LEARNING_FILE)
+        st.sidebar.caption(f"現在の学習データ数: {len(df_learn)}件")
+
 def render_trend_main():
     if 'current_trends' in st.session_state and st.session_state['current_trends']:
         st.markdown("### 📊 今日の会場別好走パターン (トレンド)")
@@ -494,19 +601,31 @@ def render_race_forecast(full_df):
 
     def calculate_rank_and_reason(row, context_df):
         odds = pd.to_numeric(row['単ｵｯｽﾞ'], errors='coerce')
-        if pd.isna(odds) or odds > 49.9: return "C", row['属性']
-        if row.get('動的ポイント', 0) < 0: return "C", row['属性']
+        if pd.isna(odds) or odds > 49.9: return "C", row['属性'] # 50倍以上は対象外(ノイズ除去)
         
+        base_points = row.get('基礎ポイント', 0)
         is_reverse, is_jockey_origin, reverse_msg = check_blue_reverse(row, context_df)
         new_reason = row['属性']
+        
+        # SSランク
         if is_reverse:
             new_reason = f"【鉄板】{reverse_msg} / " + new_reason
             if is_jockey_origin: return "SS", new_reason
-            else: return "S", new_reason
+            else: return "S", new_reason 
+            
+        # Sランク (厳格化: 基礎点5.0以上)
         if row.get('動的ポイント', 0) > 0:
-            return "S", f"【激熱】直前ペア凡走 / {new_reason}"
-        if row.get('合計ポイント', 0) >= 10.0: return "A", new_reason
-        if row.get('合計ポイント', 0) >= 7.0: return "B", new_reason
+            if base_points >= 5.0: 
+                return "S", f"【激熱】直前ペア凡走+複合好配置(点数{base_points:.1f}) / {new_reason}"
+            else:
+                return "B", f"【注】直前ペア凡走(単独) / {new_reason}" 
+
+        # Aランク (高得点条件引き上げ)
+        if row.get('合計ポイント', 0) >= 12.0: return "A", new_reason
+        
+        # Bランク
+        if row.get('合計ポイント', 0) >= 8.0: return "B", new_reason
+        
         return "C", new_reason
 
     places = sorted(df['場名'].unique())
@@ -552,7 +671,7 @@ def render_race_forecast(full_df):
     if not has_any_recommendation:
         st.info("現在、厳選条件（SS/Sランク）に合致する勝負レースはありません。")
 
-def render_main_tabs(full_df):
+def render_main_tabs(full_df, points_config):
     places = sorted(full_df['場名'].unique())
     if not places: return
     p_tabs = st.tabs(places)
@@ -618,13 +737,18 @@ def render_main_tabs(full_df):
                             for idx in full_current[(full_current['場名']==place) & (full_current['R']==r_num)].index:
                                 n = full_current.at[idx, '正番']
                                 full_current.at[idx, '着順'] = updates.get(n)
-                            new_df = update_dynamic_points_chain(full_current)
+                            
+                            new_df = update_dynamic_points_chain(full_current, points_config)
                             st.session_state['analyzed_df'] = new_df
                             st.rerun()
 
 # --- 7. メイン処理フロー ---
 def main():
     st.sidebar.title("🏇 設定・データ")
+    
+    # 設定の取得
+    points_config = render_sidebar_config()
+    
     st.sidebar.subheader("💾 途中経過の読み込み")
     uploaded_progress = st.sidebar.file_uploader("保存したCSVを読み込む", type=['csv'], key="progress")
     st.sidebar.subheader("🆕 新規分析")
@@ -650,8 +774,8 @@ def main():
             if uploaded_prev: df_prev, msg2 = load_data(uploaded_prev)
             if msg1 == "success":
                 with st.spinner("AI分析を実行中..."):
-                    df = analyze_haichi_advanced(df_curr, df_prev)
-                    df = update_dynamic_points_chain(df)
+                    df = analyze_haichi_advanced(df_curr, df_prev, points_config)
+                    df = update_dynamic_points_chain(df, points_config)
                 st.session_state['analyzed_df'] = df
                 st.session_state['last_session_key'] = session_key
             else:
@@ -665,10 +789,13 @@ def main():
         full_df.loc[(full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
         st.session_state['analyzed_df'] = full_df 
         
+        # 学習機能の表示
+        render_learning_section(full_df)
+        
         st.sidebar.markdown("---")
         if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。"):
             full_df['着順'] = np.nan
-            full_df = update_dynamic_points_chain(full_df)
+            full_df = update_dynamic_points_chain(full_df, points_config)
             st.session_state['analyzed_df'] = full_df
             st.success("着順データを全てリセットしました！")
             st.rerun()
@@ -683,7 +810,7 @@ def main():
             help="現在の状態を保存"
         )
         
-        render_main_tabs(full_df)
+        render_main_tabs(full_df, points_config)
         st.divider()
         render_trend_main()
         st.divider()
