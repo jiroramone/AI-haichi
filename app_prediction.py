@@ -10,6 +10,13 @@ st.set_page_config(page_title="配置馬券術AI分析システム", layout="wid
 
 LEARNING_FILE = "haichi_learning_data.csv"
 
+# ★正確な2025年度リーディング上位15名 (勝利数順)
+LEADING_JOCKEYS = [
+    "ルメール", "戸崎圭太", "松山弘平", "横山武史", "坂井瑠星", 
+    "川田将雅", "丹内祐次", "岩田望来", "佐々木大輔", "横山和生",
+    "菅原明良", "三浦皇成", "津村明秀", "田辺裕信", "鮫島克駿"
+]
+
 # ポイント配分設定
 DEFAULT_POINTS = {
     'pair_jockey': 4.0,          # 騎手ペア
@@ -25,7 +32,8 @@ DEFAULT_POINTS = {
     'prev_day_same_fail': 2.0,   # 前日同R同配置で凡走
     'prev_day_same_win': -2.0,   # 前日同R同配置で好走
     'trend_bonus': 3.0,          # トレンド加算
-    'learning_bonus': 3.0        # 学習データ加算
+    'learning_bonus': 3.0,       # 学習データ加算
+    'leading_jockey_bonus': 2.0  # リーディング騎手加算
 }
 
 def to_half_width(text):
@@ -128,7 +136,7 @@ def save_learning_data(current_df):
     for _, row in finished.iterrows():
         attrs = str(row['属性']).split(' / ')
         for attr in attrs:
-            if any(k in attr for k in ['ペア', '青塗', '対称']):
+            if any(k in attr for k in ['ペア', '青塗', '対称', 'リーディング']):
                 key = attr
                 if 'ペア' in attr:
                     match = re.search(r'ペア\((.*)\)', attr)
@@ -140,6 +148,8 @@ def save_learning_data(current_df):
                 elif '対称' in attr:
                     if '隣' in attr: key = '対称隣'
                     else: key = '対称'
+                elif 'リーディング' in attr:
+                    key = 'リーディング騎手'
                 
                 learning_rows.append({
                     '場名': row['場名'],
@@ -185,6 +195,7 @@ def get_learning_bonus(df, points_config):
                 if "ペア_" in p_pattern: check_key = p_pattern.split("_")[1]
                 elif "青塗" in p_pattern: check_key = "青塗"
                 elif "対称" in p_pattern: check_key = "対称"
+                elif "リーディング" in p_pattern: check_key = "リーディング"
                 
                 if check_key and check_key in attrs:
                     bonus += points_config['learning_bonus']
@@ -263,6 +274,15 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
     df['ペア対象_list'] = [[] for _ in range(len(df))] 
 
     idx_map = {(row['場名'], row['R'], row['正番']): i for i, row in df.iterrows()}
+
+    # ★リーディング騎手チェック
+    for idx, row in df.iterrows():
+        jockey_name = str(row['騎手'])
+        # 部分一致で判定
+        is_leading = any(lj in jockey_name for lj in LEADING_JOCKEYS)
+        if is_leading:
+            df.at[idx, '合計ポイント'] += points_config['leading_jockey_bonus']
+            df.at[idx, '属性_list'].append("👑リーディング騎手")
 
     # --- A. 青塗 ---
     blue_paint_targets = []
@@ -428,6 +448,8 @@ def calculate_place_trends(df):
                 elif "対称" in attr:
                     if "隣" in attr: key = "厩舎対称隣"
                     else: key = "厩舎対称"
+                elif "リーディング" in attr:
+                    key = "リーディング騎手"
                 else: continue
                 if key not in attr_stats: attr_stats[key] = {'wins': 0, 'total': 0}
                 attr_stats[key]['total'] += 1
@@ -493,6 +515,7 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
                 elif trend_key == "青塗隣" and "青塗隣" in attrs: is_match = True
                 elif trend_key == "厩舎対称" and "厩舎対称" in attrs and "隣" not in attrs: is_match = True
                 elif trend_key == "厩舎対称隣" and "厩舎対称隣" in attrs: is_match = True
+                elif trend_key == "リーディング騎手" and "リーディング" in attrs: is_match = True
                 if is_match: matched_trends.append(trend_key)
         
         if matched_trends:
@@ -519,6 +542,7 @@ def render_sidebar_config():
         st.divider()
         points_config['pair_jockey'] = st.slider("騎手ペア点", 0.0, 10.0, 4.0)
         points_config['trend_bonus'] = st.slider("トレンド加算", 0.0, 5.0, 3.0)
+        points_config['leading_jockey_bonus'] = st.slider("リーディング騎手加算", 0.0, 5.0, 2.0)
         return points_config
     return DEFAULT_POINTS
 
@@ -604,11 +628,13 @@ def render_race_forecast(full_df):
         is_reverse, is_jockey_origin, reverse_msg = check_blue_reverse(row, context_df)
         new_reason = row['属性']
         
+        # SSランク
         if is_reverse:
             new_reason = f"【鉄板】{reverse_msg} / " + new_reason
             if is_jockey_origin: return "SS", new_reason
             else: return "S", new_reason 
             
+        # Sランク
         if row.get('動的ポイント', 0) > 0:
             if base_points >= 5.0: 
                 return "S", f"【激熱】直前ペア凡走+複合好配置(点数{base_points:.1f}) / {new_reason}"
@@ -663,16 +689,15 @@ def render_main_tabs(full_df, points_config):
     places = sorted(full_df['場名'].unique())
     if not places: return
     
-    # ★修正: レース選択もラジオボタン（水平）にしてDOMを軽量化
     selected_place = st.radio("開催会場", places, horizontal=True, key="main_place_select")
     place_df = full_df[full_df['場名'] == selected_place]
     
     st.write("---")
     
     races = sorted(place_df['R'].unique())
+    # ★修正: ラジオボタンに変更して軽量化
     selected_race = st.radio("レースを選択", races, horizontal=True, format_func=lambda x: f"{x}R", key="main_race_select")
     
-    # 選ばれたレースだけを描画（これでエラーは起きない）
     r_num = selected_race
     race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
     
