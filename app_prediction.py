@@ -35,37 +35,25 @@ def normalize_name(x):
     s = s.replace('　', '').replace(' ', '')
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み (シート検索機能付き) ---
+# --- 2. データ読み込み (自動列作成機能付き) ---
 @st.cache_data
 def load_data(file):
     try:
-        # エクセルの場合
+        # エクセルまたはCSVの読み込み
         if file.name.endswith('.xlsx'):
-            # まずエクセルファイルとして開く
             xls = pd.ExcelFile(file, engine='openpyxl')
             sheet_names = xls.sheet_names
-            
-            # ターゲットとなるシート名を探す
-            target_sheet = None
+            target_sheet = sheet_names[0]
             for sheet in sheet_names:
-                # "全出走馬" または "出走" が含まれるシートを優先
                 if "全出走馬" in sheet or "出走" in sheet:
                     target_sheet = sheet
                     break
-            
-            # 見つからなければ最初のシートを使う
-            if target_sheet is None:
-                target_sheet = sheet_names[0]
-            
-            # 特定したシートを読み込む
             df = pd.read_excel(xls, sheet_name=target_sheet)
-            
-        # CSVの場合
         else:
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
-        # ヘッダー行の自動探索 (既存機能)
+        # ヘッダー行の自動探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -75,6 +63,7 @@ def load_data(file):
 
         df.columns = df.columns.astype(str).str.strip()
         
+        # カラム名の統一
         name_map = {
             '場所': '場名', '開催': '場名', '競馬場': '場名',
             '調教師': '厩舎', '調教師名': '厩舎', '厩舎名': '厩舎',
@@ -84,10 +73,13 @@ def load_data(file):
         }
         df = df.rename(columns=name_map)
         
+        # 必須カラムの確保 (着順がない場合はここで作成されます)
         ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ', '着順']
         for col in ensure_cols:
-            if col not in df.columns: df[col] = np.nan
+            if col not in df.columns:
+                df[col] = np.nan # 列がない場合は空っぽ(NaN)で作成
 
+        # 数値変換とクリーニング
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce')
         df = df.dropna(subset=['R', '正番'])
@@ -99,7 +91,7 @@ def load_data(file):
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
-        # 未出走データのクリーニング (0や空白をNaNにする)
+        # 着順のクリーニング (0や空欄を「未出走(NaN)」にする)
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
         df.loc[df['着順'] <= 0, '着順'] = np.nan
         
@@ -133,7 +125,6 @@ def identify_pair_patterns(r1, r2):
     if s1 != s2 and (s1 % 10 == s2 % 10):
         if s1 < s2: patterns.append('Q')
         else: patterns.append('R')
-        
     return patterns
 
 def extract_patterns(row):
@@ -147,7 +138,7 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 強制クリーニング
+    # 強制クリーニング(念のため)
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
     df.loc[df['着順'] <= 0, '着順'] = np.nan
     
@@ -343,7 +334,6 @@ def calculate_place_trends(df):
                     if "隣" in attr: key = "厩舎対称隣"
                     else: key = "厩舎対称"
                 else: continue
-                
                 if key not in attr_stats: attr_stats[key] = {'wins': 0, 'total': 0}
                 attr_stats[key]['total'] += 1
                 if row['is_win']: attr_stats[key]['wins'] += 1
@@ -483,7 +473,6 @@ def render_race_forecast(full_df):
     for p_tab, place in zip(p_tabs, places):
         with p_tab:
             place_df = df[df['場名'] == place]
-            
             target_races = []
             race_data_map = {} 
 
@@ -645,11 +634,11 @@ def main():
                 st.error(f"読み込みエラー: {msg1}")
     
     if 'analyzed_df' in st.session_state:
-        # 強制リセット: メモリ内のデータに対しても「0→NaN」を適用
+        # メモリ上のデータも強制クリーニング
         full_df = st.session_state['analyzed_df']
         full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
         full_df.loc[full_df['着順'] <= 0, '着順'] = np.nan
-        st.session_state['analyzed_df'] = full_df # 更新
+        st.session_state['analyzed_df'] = full_df 
         
         render_trend_sidebar()
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
