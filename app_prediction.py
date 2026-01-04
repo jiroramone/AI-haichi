@@ -35,7 +35,7 @@ def normalize_name(x):
     s = s.replace('　', '').replace(' ', '')
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み (高度な自動修復付き) ---
+# --- 2. データ読み込み (強制リセット機能付き) ---
 @st.cache_data
 def load_data(file):
     try:
@@ -43,7 +43,6 @@ def load_data(file):
         if file.name.endswith('.xlsx'):
             xls = pd.ExcelFile(file, engine='openpyxl')
             sheet_names = xls.sheet_names
-            # 「全出走馬」を含むシートを優先、なければ1枚目
             target_sheet = sheet_names[0]
             for sheet in sheet_names:
                 if "全出走馬" in sheet or "出走" in sheet:
@@ -70,52 +69,43 @@ def load_data(file):
             '調教師': '厩舎', '調教師名': '厩舎', '厩舎名': '厩舎',
             '騎手名': '騎手', 'レース': 'R', 'Ｒ': 'R', '番': '正番', '馬番': '正番',
             '単オッズ': '単ｵｯｽﾞ', '単勝オッズ': '単ｵｯｽﾞ', 'オッズ': '単ｵｯｽﾞ',
-            '着': '着順', '着順': '着順'
+            '着': '着順', '着順': '着順' # 一旦マッピングするが、直後に削除する
         }
         df = df.rename(columns=name_map)
         
-        # D. ★重要: 厩舎カラムの自動復旧
-        # もし「厩舎」が見つからず、「斤量」と「馬主」があるなら、その間の列を厩舎とみなす
+        # D. ★最重要修正: 元ファイルの着順データを完全に無視して削除
+        if '着順' in df.columns:
+            df = df.drop(columns=['着順'])
+            
+        # E. 新しく真っ白な「着順」列を作成 (全レース未出走状態にする)
+        df['着順'] = np.nan
+
+        # F. 厩舎カラムの自動復旧
         if '厩舎' not in df.columns:
             cols = df.columns.tolist()
             if '斤量' in cols and '馬主' in cols:
                 idx_w = cols.index('斤量')
-                # 斤量の次の列を厩舎として採用（よくあるフォーマット対応）
                 if idx_w + 1 < len(cols):
                     potential_col = cols[idx_w + 1]
                     df = df.rename(columns={potential_col: '厩舎'})
 
-        # E. 必須カラムの確保
-        ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ', '着順']
+        # G. 必須カラムの確保
+        ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ']
         for col in ensure_cols:
             if col not in df.columns:
                 df[col] = np.nan
 
-        # F. 数値変換とクリーニング
+        # H. 数値変換とクリーニング
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce')
         df = df.dropna(subset=['R', '正番'])
         df['R'] = df['R'].astype(int)
         df['正番'] = df['正番'].astype(int)
         
-        # 名前系データのクリーニング (空文字統一)
         for col in ['騎手', '厩舎', '馬主', '馬名', '場名']:
             df[col] = df[col].apply(normalize_name)
-            # 全員が同じ名前(空文字)になるのを防ぐため、欠損はNaNのままにするか注意
-            # ここではnormalize_nameがNaNを''にするので、後段で''を無視するロジックが必要
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
-
-        # G. ★重要: 着順の強力クリーニング (オッズ差などの誤入力を排除)
-        df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-        
-        # 1. 小数点を含む値(1.3など)は着順ではないので削除
-        is_decimal = (df['着順'] % 1 != 0) & (df['着順'].notna())
-        if is_decimal.sum() > 0:
-            df.loc[is_decimal, '着順'] = np.nan
-            
-        # 2. 0以下 または 19以上(異常値) は削除
-        df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
         
         return df.copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
@@ -160,10 +150,6 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 着順再チェック
-    df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-    df.loc[(df['着順'] % 1 != 0) | (df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
-    
     max_umaban = df.groupby(['場名', 'R'])['正番'].transform('max')
     df['頭数'] = max_umaban.fillna(16).astype(int)
     df['逆番'] = (df['頭数'] + 1) - df['正番']
@@ -193,7 +179,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     blue_paint_targets = []
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
-            # ★重要: 名前が空文字(不明)の場合はグループ化しない
             if len(group) < 2 or name == '': continue
             
             group['正循環'] = group['頭数'] + group['正番']
@@ -246,7 +231,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     # --- C. ペア ---
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
-            # ★重要: 名前が空文字の場合はスキップ
             if len(group) < 2 or name == '': continue
             
             group['正循環'] = group['頭数'] + group['正番']
@@ -279,7 +263,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     for (place, r), race_group in df.groupby(['場名', 'R']):
         symmetry_targets = set()
         for stable_name, stable_group in race_group.groupby('厩舎'):
-            # ★重要: 厩舎名がない場合はスキップ
             if len(stable_group) < 2 or stable_name == '': continue
             
             stable_group['正循環'] = stable_group['頭数'] + stable_group['正番']
@@ -381,9 +364,7 @@ def update_dynamic_points_chain(df):
     bonus_map = {} 
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
-            # 名前なしはスキップ
             if len(group) < 2 or name == '': continue
-            
             rows = group.sort_values('R').to_dict('records')
             expectation_alive = True 
             for i in range(len(rows)):
@@ -434,21 +415,30 @@ def update_dynamic_points_chain(df):
     return df
 
 # --- 5. UIコンポーネント ---
-def render_trend_sidebar():
+def render_trend_main():
     if 'current_trends' in st.session_state and st.session_state['current_trends']:
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("### 📊 今日の会場別トレンド")
+        st.markdown("### 📊 今日の会場別好走パターン (トレンド)")
         trends = st.session_state['current_trends']
-        for place, data in trends.items():
-            if not data: continue
-            st.sidebar.markdown(f"**{place}**")
-            for kw, val in data.items():
-                rate_pct = int(val['rate'] * 100)
-                if "パターン" in kw:
-                    st.sidebar.markdown(f"- :red[{kw}]: 好走率**{rate_pct}%** ({val['count']}件)")
-                else:
-                    st.sidebar.caption(f"- {kw}: 好走率**{rate_pct}%** ({val['count']}件)")
-            st.sidebar.markdown("---")
+        places = list(trends.keys())
+        
+        if not places:
+            st.info("まだ確定したレースがないため、トレンドは分析されていません。")
+            return
+
+        cols = st.columns(len(places))
+        for i, place in enumerate(places):
+            data = trends[place]
+            with cols[i]:
+                st.success(f"**{place} の傾向**")
+                if not data:
+                    st.caption("データなし")
+                    continue
+                for kw, val in data.items():
+                    rate_pct = int(val['rate'] * 100)
+                    if "パターン" in kw:
+                        st.markdown(f"- :red[**{kw}**]: 好走率 **{rate_pct}%** ({val['count']}件)")
+                    else:
+                        st.markdown(f"- {kw}: 好走率 **{rate_pct}%** ({val['count']}件)")
 
 def render_race_forecast(full_df):
     st.markdown("### 🎯 厳選勝負レース (推奨買い目)")
@@ -640,7 +630,7 @@ def main():
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
     
-    full_df = None # 変数を必ず初期化
+    full_df = None
 
     if uploaded_progress:
         try:
@@ -669,13 +659,6 @@ def main():
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
-        # メモリ上のデータも強制クリーニング
-        full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
-        # 0や小数点を排除
-        full_df.loc[(full_df['着順'] % 1 != 0) | (full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
-        st.session_state['analyzed_df'] = full_df 
-        
-        # リセットボタン
         st.sidebar.markdown("---")
         if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。"):
             full_df['着順'] = np.nan
@@ -684,9 +667,7 @@ def main():
             st.success("着順データを全てリセットしました！")
             st.rerun()
 
-    # full_dfが存在する場合のみ描画を実行
     if full_df is not None:
-        render_trend_sidebar()
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button(
             "💾 分析データを保存 (CSV)",
@@ -695,6 +676,9 @@ def main():
             "text/csv",
             help="現在の状態を保存"
         )
+        
+        render_trend_main()
+        st.divider()
         render_race_forecast(full_df)
         render_main_tabs(full_df)
     else:
