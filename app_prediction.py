@@ -35,16 +35,37 @@ def normalize_name(x):
     s = s.replace('　', '').replace(' ', '')
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み ---
+# --- 2. データ読み込み (シート検索機能付き) ---
 @st.cache_data
 def load_data(file):
     try:
+        # エクセルの場合
         if file.name.endswith('.xlsx'):
-            df = pd.read_excel(file, engine='openpyxl')
+            # まずエクセルファイルとして開く
+            xls = pd.ExcelFile(file, engine='openpyxl')
+            sheet_names = xls.sheet_names
+            
+            # ターゲットとなるシート名を探す
+            target_sheet = None
+            for sheet in sheet_names:
+                # "全出走馬" または "出走" が含まれるシートを優先
+                if "全出走馬" in sheet or "出走" in sheet:
+                    target_sheet = sheet
+                    break
+            
+            # 見つからなければ最初のシートを使う
+            if target_sheet is None:
+                target_sheet = sheet_names[0]
+            
+            # 特定したシートを読み込む
+            df = pd.read_excel(xls, sheet_name=target_sheet)
+            
+        # CSVの場合
         else:
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
+        # ヘッダー行の自動探索 (既存機能)
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -78,7 +99,7 @@ def load_data(file):
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
-        # キャッシュ作成時にも0を除去
+        # 未出走データのクリーニング (0や空白をNaNにする)
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
         df.loc[df['着順'] <= 0, '着順'] = np.nan
         
@@ -126,7 +147,7 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 強制クリーニング: 分析直前にも再度0を除去
+    # 強制クリーニング
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
     df.loc[df['着順'] <= 0, '着順'] = np.nan
     
@@ -322,6 +343,7 @@ def calculate_place_trends(df):
                     if "隣" in attr: key = "厩舎対称隣"
                     else: key = "厩舎対称"
                 else: continue
+                
                 if key not in attr_stats: attr_stats[key] = {'wins': 0, 'total': 0}
                 attr_stats[key]['total'] += 1
                 if row['is_win']: attr_stats[key]['wins'] += 1
@@ -623,7 +645,7 @@ def main():
                 st.error(f"読み込みエラー: {msg1}")
     
     if 'analyzed_df' in st.session_state:
-        # ★強制リセット: メモリ内のデータに対しても「0→NaN」を適用
+        # 強制リセット: メモリ内のデータに対しても「0→NaN」を適用
         full_df = st.session_state['analyzed_df']
         full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
         full_df.loc[full_df['着順'] <= 0, '着順'] = np.nan
