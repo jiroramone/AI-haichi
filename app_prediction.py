@@ -91,8 +91,9 @@ def load_data(file):
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
-        # 着順のクリーニング
+        # 着順の強力クリーニング
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
+        # 0以下 または 19以上(異常値) は削除
         df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
         
         return df.copy(), "success"
@@ -138,7 +139,7 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 強制クリーニング
+    # 分析直前にもクリーニング
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
     df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
@@ -609,8 +610,6 @@ def main():
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
     
-    full_df = None # 変数を初期化
-
     if uploaded_progress:
         try:
             df = pd.read_csv(uploaded_progress)
@@ -652,8 +651,6 @@ def main():
             st.success("着順データを全てリセットしました！")
             st.rerun()
 
-    # full_dfが有効な場合のみ描画処理を行う
-    if full_df is not None:
         render_trend_sidebar()
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button(
