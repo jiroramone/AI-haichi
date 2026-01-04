@@ -35,7 +35,7 @@ def normalize_name(x):
     s = s.replace('　', '').replace(' ', '')
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み (自動列作成機能付き) ---
+# --- 2. データ読み込み ---
 @st.cache_data
 def load_data(file):
     try:
@@ -73,11 +73,11 @@ def load_data(file):
         }
         df = df.rename(columns=name_map)
         
-        # 必須カラムの確保 (着順がない場合はここで作成されます)
+        # 必須カラムの確保
         ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ', '着順']
         for col in ensure_cols:
             if col not in df.columns:
-                df[col] = np.nan # 列がない場合は空っぽ(NaN)で作成
+                df[col] = np.nan
 
         # 数値変換とクリーニング
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
@@ -91,9 +91,11 @@ def load_data(file):
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
-        # 着順のクリーニング (0や空欄を「未出走(NaN)」にする)
+        # ★着順の強力クリーニング
+        # 1. 数値化できないものは削除
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-        df.loc[df['着順'] <= 0, '着順'] = np.nan
+        # 2. 0以下 または 19以上(異常値) は削除 (誤って枠番やオッズを読み込んだ場合の対策)
+        df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
         
         return df.copy(), "success"
     except Exception as e: return pd.DataFrame(), str(e)
@@ -138,9 +140,9 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 強制クリーニング(念のため)
+    # 分析直前にもクリーニング
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-    df.loc[df['着順'] <= 0, '着順'] = np.nan
+    df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
     max_umaban = df.groupby(['場名', 'R'])['正番'].transform('max')
     df['頭数'] = max_umaban.fillna(16).astype(int)
@@ -634,12 +636,17 @@ def main():
                 st.error(f"読み込みエラー: {msg1}")
     
     if 'analyzed_df' in st.session_state:
-        # メモリ上のデータも強制クリーニング
-        full_df = st.session_state['analyzed_df']
-        full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
-        full_df.loc[full_df['着順'] <= 0, '着順'] = np.nan
-        st.session_state['analyzed_df'] = full_df 
-        
+        # サイドバーにリセットボタンを設置
+        st.sidebar.markdown("---")
+        if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。全ての着順をクリアします。"):
+            full_df = st.session_state['analyzed_df']
+            full_df['着順'] = np.nan
+            # 動的ポイントも再計算
+            full_df = update_dynamic_points_chain(full_df)
+            st.session_state['analyzed_df'] = full_df
+            st.success("着順データを全てリセットしました！")
+            st.rerun()
+
         render_trend_sidebar()
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button(
