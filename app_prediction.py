@@ -35,13 +35,15 @@ def normalize_name(x):
     s = s.replace('　', '').replace(' ', '')
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み ---
+# --- 2. データ読み込み (高度な自動修復付き) ---
 @st.cache_data
 def load_data(file):
     try:
+        # A. ファイル読み込み
         if file.name.endswith('.xlsx'):
             xls = pd.ExcelFile(file, engine='openpyxl')
             sheet_names = xls.sheet_names
+            # 「全出走馬」を含むシートを優先、なければ1枚目
             target_sheet = sheet_names[0]
             for sheet in sheet_names:
                 if "全出走馬" in sheet or "出走" in sheet:
@@ -52,6 +54,7 @@ def load_data(file):
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
+        # B. ヘッダー自動探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -61,6 +64,7 @@ def load_data(file):
 
         df.columns = df.columns.astype(str).str.strip()
         
+        # C. カラム名の正規化
         name_map = {
             '場所': '場名', '開催': '場名', '競馬場': '場名',
             '調教師': '厩舎', '調教師名': '厩舎', '厩舎名': '厩舎',
@@ -70,22 +74,47 @@ def load_data(file):
         }
         df = df.rename(columns=name_map)
         
+        # D. ★重要: 厩舎カラムの自動復旧
+        # もし「厩舎」が見つからず、「斤量」と「馬主」があるなら、その間の列を厩舎とみなす
+        if '厩舎' not in df.columns:
+            cols = df.columns.tolist()
+            if '斤量' in cols and '馬主' in cols:
+                idx_w = cols.index('斤量')
+                # 斤量の次の列を厩舎として採用（よくあるフォーマット対応）
+                if idx_w + 1 < len(cols):
+                    potential_col = cols[idx_w + 1]
+                    df = df.rename(columns={potential_col: '厩舎'})
+
+        # E. 必須カラムの確保
         ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ', '着順']
         for col in ensure_cols:
-            if col not in df.columns: df[col] = np.nan
+            if col not in df.columns:
+                df[col] = np.nan
 
+        # F. 数値変換とクリーニング
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce')
         df = df.dropna(subset=['R', '正番'])
         df['R'] = df['R'].astype(int)
         df['正番'] = df['正番'].astype(int)
         
+        # 名前系データのクリーニング (空文字統一)
         for col in ['騎手', '厩舎', '馬主', '馬名', '場名']:
             df[col] = df[col].apply(normalize_name)
+            # 全員が同じ名前(空文字)になるのを防ぐため、欠損はNaNのままにするか注意
+            # ここではnormalize_nameがNaNを''にするので、後段で''を無視するロジックが必要
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
+        # G. ★重要: 着順の強力クリーニング (オッズ差などの誤入力を排除)
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
+        
+        # 1. 小数点を含む値(1.3など)は着順ではないので削除
+        is_decimal = (df['着順'] % 1 != 0) & (df['着順'].notna())
+        if is_decimal.sum() > 0:
+            df.loc[is_decimal, '着順'] = np.nan
+            
+        # 2. 0以下 または 19以上(異常値) は削除
         df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
         
         return df.copy(), "success"
@@ -131,8 +160,9 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
+    # 着順再チェック
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-    df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
+    df.loc[(df['着順'] % 1 != 0) | (df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
     max_umaban = df.groupby(['場名', 'R'])['正番'].transform('max')
     df['頭数'] = max_umaban.fillna(16).astype(int)
@@ -163,11 +193,11 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     blue_paint_targets = []
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
-            if len(group) < 2: continue
+            # ★重要: 名前が空文字(不明)の場合はグループ化しない
+            if len(group) < 2 or name == '': continue
             
             group['正循環'] = group['頭数'] + group['正番']
             group['逆循環'] = group['頭数'] + group['逆番']
-            
             sets_list = [{r['正番'], r['逆番'], r['正循環'], r['逆循環']} for _, r in group.iterrows()]
             common_nums = set.intersection(*sets_list)
             
@@ -208,7 +238,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
             r_row = idx_map.get(right_key)
             l_odds = pd.to_numeric(df.at[l_row, '単ｵｯｽﾞ'], errors='coerce') if l_row else np.nan
             r_odds = pd.to_numeric(df.at[r_row, '単ｵｯｽﾞ'], errors='coerce') if r_row else np.nan
-            
             if pd.notna(my_odds) and pd.notna(l_odds) and pd.notna(r_odds):
                 if my_odds < l_odds and my_odds < r_odds:
                     df.at[idx, '合計ポイント'] += HAICHI_POINTS['sandwich_bonus']
@@ -217,7 +246,8 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
     # --- C. ペア ---
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
-            if len(group) < 2: continue
+            # ★重要: 名前が空文字の場合はスキップ
+            if len(group) < 2 or name == '': continue
             
             group['正循環'] = group['頭数'] + group['正番']
             group['逆循環'] = group['頭数'] + group['逆番']
@@ -245,31 +275,27 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                             target_r = r2['R'] if r_data['R'] == r1['R'] else r1['R']
                             df.at[idx, 'ペア対象_list'].append({'R': target_r, 'cat': category})
 
-    # --- D. 対称 & 対称隣 (厳密化) ---
+    # --- D. 対称 & 対称隣 ---
     for (place, r), race_group in df.groupby(['場名', 'R']):
-        symmetry_targets = set() # 重複しないようにsetを使用
-        
+        symmetry_targets = set()
         for stable_name, stable_group in race_group.groupby('厩舎'):
-            if len(stable_group) < 2: continue
+            # ★重要: 厩舎名がない場合はスキップ
+            if len(stable_group) < 2 or stable_name == '': continue
             
             stable_group['正循環'] = stable_group['頭数'] + stable_group['正番']
             stable_group['逆循環'] = stable_group['頭数'] + stable_group['逆番']
             s_rows = stable_group.to_dict('records')
             
-            # 対称ペアになっている当事者だけを抽出
             found_symmetry = False
             for i in range(len(s_rows)):
                 for j in range(i + 1, len(s_rows)):
                     s1 = {s_rows[i]['正番'], s_rows[i]['逆番'], s_rows[i]['正循環'], s_rows[i]['逆循環']}
                     s2 = {s_rows[j]['正番'], s_rows[j]['逆番'], s_rows[j]['正循環'], s_rows[j]['逆循環']}
-                    
-                    if s1.intersection(s2): 
-                        # マッチした馬の正番を記録
+                    if s1.intersection(s2):
                         symmetry_targets.add(s_rows[i]['正番'])
                         symmetry_targets.add(s_rows[j]['正番'])
                         found_symmetry = True
             
-            # 当事者にのみタグ付け
             if found_symmetry:
                 for idx_s, row_s in stable_group.iterrows():
                     if row_s['正番'] in symmetry_targets:
@@ -277,12 +303,10 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                             df.at[idx_s, '合計ポイント'] += HAICHI_POINTS['stable_symmetry']
                             df.at[idx_s, '属性_list'].append("◇厩舎対称")
 
-        # 対称隣への加算
         for sym_num in symmetry_targets:
             for neighbor_num in [sym_num - 1, sym_num + 1]:
                 idx = idx_map.get((place, r, neighbor_num))
                 if idx is not None:
-                    # 自分自身が対象にならないように注意（対称同士が隣り合うケースもあるが加算して良い）
                     tag = "◆厩舎対称隣"
                     if tag not in df.at[idx, '属性_list']:
                         df.at[idx, '合計ポイント'] += HAICHI_POINTS['stable_symmetry_neighbor']
@@ -351,53 +375,30 @@ def calculate_place_trends(df):
     return trends
 
 def update_dynamic_points_chain(df):
-    """
-    修正版: 未出走のレースには加点しない（フライング激熱の防止）
-    """
     if '着順' not in df.columns: return df
     
     df['動的ポイント'] = 0.0
     bonus_map = {} 
-    
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
-            if len(group) < 2: continue
+            # 名前なしはスキップ
+            if len(group) < 2 or name == '': continue
+            
             rows = group.sort_values('R').to_dict('records')
-            
-            # ステータス: 0=未確定/保留, 1=激熱モード(直前が凡走), -1=終了モード(誰かが好走済)
-            chain_status = 0 
-            
+            expectation_alive = True 
             for i in range(len(rows)):
                 curr_row = rows[i]
                 mask = (df['場名'] == curr_row['場名']) & (df['R'] == curr_row['R']) & (df['正番'] == curr_row['正番'])
                 if mask.sum() == 0: continue
                 curr_idx = df[mask].index[0]
-                
                 rank = pd.to_numeric(curr_row['着順'], errors='coerce')
                 is_finished = pd.notna(rank)
                 is_win = is_finished and rank <= 3
-                
-                # --- ポイント適用 ---
-                if chain_status == 1:
-                    # 激熱モードかつ、自分がまだ走っていないなら加点
-                    if not is_finished:
-                        bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) + 2.0
-                elif chain_status == -1:
-                    # もう終わったチェーンなので減点
+                if not expectation_alive:
                     bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) - 2.0
-                
-                # --- 次の馬へのステータス更新 ---
-                if is_win:
-                    chain_status = -1 # 勝ち抜け、終了
-                elif is_finished:
-                    # 凡走確定 -> 次はチャンス (まだ終了モードでなければ)
-                    if chain_status != -1:
-                        chain_status = 1
-                else:
-                    # 未出走 -> 結果不明のためチェーン保留 (次は加点なし)
-                    # ※前の馬が未出走なら、次の馬もまだ待機状態
-                    chain_status = 0
-
+                elif not is_finished:
+                    if i > 0: bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) + 2.0
+                if is_win: expectation_alive = False
     for idx, bonus in bonus_map.items():
         df.at[idx, '動的ポイント'] += bonus
         df.at[idx, '合計ポイント'] += bonus 
@@ -668,11 +669,13 @@ def main():
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         
-        # 強制リセット: メモリ内のデータに対しても「0→NaN」を適用
+        # メモリ上のデータも強制クリーニング
         full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
-        full_df.loc[(full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
+        # 0や小数点を排除
+        full_df.loc[(full_df['着順'] % 1 != 0) | (full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
         st.session_state['analyzed_df'] = full_df 
         
+        # リセットボタン
         st.sidebar.markdown("---")
         if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。"):
             full_df['着順'] = np.nan
