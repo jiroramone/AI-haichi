@@ -9,17 +9,14 @@ st.set_page_config(page_title="配置馬券術AI分析システム", layout="wid
 # ポイント配分設定
 HAICHI_POINTS = {
     # 基礎点
-    'pair_jockey': 3.0,          # 騎手ペア
+    'pair_jockey': 3.0,          # 騎手ペア (重要)
     'pair_stable_owner': 1.0,    # 厩舎・馬主ペア
-    
-    'blue_jockey': 4.0,          # 騎手青塗
+    'blue_jockey': 4.0,          # 騎手青塗 (最強)
     'blue_stable_owner': 2.0,    # 厩舎・馬主青塗
     'blue_neighbor': 2.0,        # 青塗隣
     'sandwich_bonus': 4.0,       # 青塗サンドイッチ
-    
     'stable_symmetry': 2.0,      # 厩舎対称配置 (本体)
-    'stable_symmetry_neighbor': 2.0, # ★追加: 厩舎対称配置 (隣)
-    
+    'stable_symmetry_neighbor': 2.0, # 厩舎対称配置 (隣)
     'continuous': 1.0,           # 連続レース配置
     
     # 変動点
@@ -239,9 +236,9 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
                             target_r = r2['R'] if r_data['R'] == r1['R'] else r1['R']
                             df.at[idx, 'ペア対象_list'].append({'R': target_r, 'cat': category})
 
-    # --- D. 対称 & ★対称隣 (New!) ---
+    # --- D. 対称 & 対称隣 ---
     for (place, r), race_group in df.groupby(['場名', 'R']):
-        symmetry_targets = [] # 対称配置になった馬を記録
+        symmetry_targets = []
         
         for stable_name, stable_group in race_group.groupby('厩舎'):
             if len(stable_group) < 2: continue
@@ -259,12 +256,11 @@ def analyze_haichi_advanced(df_curr, df_prev=None):
             
             if has_symmetry:
                 for idx_s, row_s in stable_group.iterrows():
-                    symmetry_targets.append(row_s['正番']) # 記録
+                    symmetry_targets.append(row_s['正番'])
                     if "◇厩舎対称" not in df.at[idx_s, '属性_list']:
                         df.at[idx_s, '合計ポイント'] += HAICHI_POINTS['stable_symmetry']
                         df.at[idx_s, '属性_list'].append("◇厩舎対称")
 
-        # 対称隣への加算処理
         for sym_num in symmetry_targets:
             for neighbor_num in [sym_num - 1, sym_num + 1]:
                 idx = idx_map.get((place, r, neighbor_num))
@@ -460,63 +456,97 @@ def render_race_forecast(full_df):
     places = sorted(df['場名'].unique())
     has_recommendation = False
     p_tabs = st.tabs(places)
+    
     for p_tab, place in zip(p_tabs, places):
         with p_tab:
             place_df = df[df['場名'] == place]
-            races = sorted(place_df['R'].unique())
-            for r_num in races:
+            
+            # --- 推奨レースのあるR番号だけを抽出してタブ化 ---
+            # まず全レースをチェックして推奨馬がいるか確認
+            target_races = []
+            race_data_map = {} # r_num -> (axis_horse, opp_nums, opp_str)
+
+            all_races = sorted(place_df['R'].unique())
+            for r_num in all_races:
                 race_df = place_df[place_df['R'] == r_num].copy()
-                if not race_df[pd.to_numeric(race_df['着順'], errors='coerce').isna()].empty:
-                    results = race_df.apply(lambda x: calculate_rank_and_reason(x, df), axis=1)
-                    race_df['ランク'] = [r[0] for r in results]
-                    race_df['拡張根拠'] = [r[1] for r in results]
-                    axis_candidates = race_df[race_df['ランク'].isin(['SS', 'S'])]
-                    if not axis_candidates.empty:
-                        has_recommendation = True
-                        rank_map = {'SS': 3, 'S': 2}
-                        axis_candidates['rank_score'] = axis_candidates['ランク'].map(rank_map)
-                        axis_horse = axis_candidates.sort_values(['rank_score', '合計ポイント'], ascending=[False, False]).iloc[0]
-                        opponents = race_df[
-                            (race_df['正番'] != axis_horse['正番']) &
-                            (race_df['動的ポイント'] >= 0) &
-                            ((race_df['合計ポイント'] >= 3.0) | (race_df['人気ランク'] <= 5))
-                        ].sort_values(['合計ポイント', '人気ランク'], ascending=[False, True]).head(4)
-                        opp_nums = opponents['正番'].astype(str).tolist()
-                        opp_str = ",".join(opp_nums)
-                        with st.container():
-                            rank_color = "red" if axis_horse['ランク'] == "SS" else "orange"
-                            st.markdown(f"##### :{rank_color}[【{axis_horse['ランク']}】 {place} {r_num}R] 軸: {axis_horse['正番']} {axis_horse['馬名']} ({axis_horse['騎手']})")
-                            c1, c2 = st.columns([2, 3])
-                            with c1:
-                                st.info(f"**根拠**: {axis_horse['拡張根拠']}")
-                                st.write(f"オッズ: **{axis_horse['単ｵｯｽﾞ']}**倍 / スコア: **{axis_horse['合計ポイント']}**")
-                            with c2:
-                                st.write("**🎫 推奨買い目**")
-                                bets = []
-                                an = axis_horse['正番']
-                                if opp_nums:
-                                    bets.append(f"- **ワイド**: {an} － {opp_str}")
-                                    if axis_horse['ランク'] == 'SS' or float(axis_horse['単ｵｯｽﾞ']) >= 10:
-                                        bets.append(f"- **3連複**: {an} － {opp_str} (ボーナス)")
-                                else:
-                                    bets.append("- 単勝推奨 (相手不在)")
-                                for b in bets: st.write(b)
-                            st.markdown("---")
+                # 未来のレースのみ
+                if race_df[pd.to_numeric(race_df['着順'], errors='coerce').isna()].empty:
+                    continue
+                
+                # ランク計算
+                results = race_df.apply(lambda x: calculate_rank_and_reason(x, df), axis=1)
+                race_df['ランク'] = [r[0] for r in results]
+                race_df['拡張根拠'] = [r[1] for r in results]
+                
+                axis_candidates = race_df[race_df['ランク'].isin(['SS', 'S'])]
+                
+                if not axis_candidates.empty:
+                    rank_map = {'SS': 3, 'S': 2}
+                    axis_candidates['rank_score'] = axis_candidates['ランク'].map(rank_map)
+                    axis_horse = axis_candidates.sort_values(['rank_score', '合計ポイント'], ascending=[False, False]).iloc[0]
+                    
+                    opponents = race_df[
+                        (race_df['正番'] != axis_horse['正番']) &
+                        (race_df['動的ポイント'] >= 0) &
+                        ((race_df['合計ポイント'] >= 3.0) | (race_df['人気ランク'] <= 5))
+                    ].sort_values(['合計ポイント', '人気ランク'], ascending=[False, True]).head(4)
+                    
+                    opp_nums = opponents['正番'].astype(str).tolist()
+                    opp_str = ",".join(opp_nums)
+                    
+                    # 保存
+                    target_races.append(r_num)
+                    race_data_map[r_num] = (axis_horse, opp_nums, opp_str)
+                    has_recommendation = True
+
+            if not target_races:
+                st.info("この会場には現在、推奨条件(SS/Sランク)に合致するレースはありません。")
+                continue
+
+            # レースタブ作成
+            r_tabs = st.tabs([f"{r}R" for r in target_races])
+            for r_tab, r_num in zip(r_tabs, target_races):
+                with r_tab:
+                    axis_horse, opp_nums, opp_str = race_data_map[r_num]
+                    
+                    with st.container():
+                        rank_color = "red" if axis_horse['ランク'] == "SS" else "orange"
+                        st.markdown(f"##### :{rank_color}[【{axis_horse['ランク']}】 {place} {r_num}R] 軸: {axis_horse['正番']} {axis_horse['馬名']} ({axis_horse['騎手']})")
+                        c1, c2 = st.columns([2, 3])
+                        with c1:
+                            st.info(f"**根拠**: {axis_horse['拡張根拠']}")
+                            st.write(f"オッズ: **{axis_horse['単ｵｯｽﾞ']}**倍 / スコア: **{axis_horse['合計ポイント']}**")
+                        with c2:
+                            st.write("**🎫 推奨買い目**")
+                            bets = []
+                            an = axis_horse['正番']
+                            if opp_nums:
+                                bets.append(f"- **ワイド**: {an} － {opp_str}")
+                                if axis_horse['ランク'] == 'SS' or float(axis_horse['単ｵｯｽﾞ']) >= 10:
+                                    bets.append(f"- **3連複**: {an} － {opp_str} (ボーナス)")
+                            else:
+                                bets.append("- 単勝推奨 (相手不在)")
+                            for b in bets: st.write(b)
+                        st.markdown("---")
+
     if not has_recommendation:
         st.info("現在、厳選条件（SS/Sランク）に合致する勝負レースはありません。")
 
 def render_main_tabs(full_df):
     places = sorted(full_df['場名'].unique())
     if not places: return
+
     p_tabs = st.tabs(places)
     for p_tab, place in zip(p_tabs, places):
         with p_tab:
             place_df = full_df[full_df['場名'] == place]
             races = sorted(place_df['R'].unique())
             r_tabs = st.tabs([f"{r}R" for r in races])
+
             for r_tab, r_num in zip(r_tabs, races):
                 with r_tab:
                     race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
+                    
                     with st.expander("📝 結果入力・修正", expanded=True):
                         c1, c2 = st.columns([3, 1])
                         with c1:
@@ -538,9 +568,11 @@ def render_main_tabs(full_df):
                                 for idx in full_current[(full_current['場名']==place) & (full_current['R']==r_num)].index:
                                     n = full_current.at[idx, '正番']
                                     full_current.at[idx, '着順'] = updates.get(n)
+                                
                                 new_df = update_dynamic_points_chain(full_current)
                                 st.session_state['analyzed_df'] = new_df
                                 st.rerun()
+
                     st.markdown("##### 📊 分析チャート")
                     disp = race_df.copy()
                     def get_status(row):
@@ -556,13 +588,14 @@ def render_main_tabs(full_df):
                             links.append(f"{icon}{t['R']}R")
                         return " ".join(links)
                     disp['連動'] = disp.apply(get_link, axis=1)
+
                     st.dataframe(
                         disp[['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']],
                         column_config={
                             "馬名": st.column_config.TextColumn("馬名", width="medium"),
                             "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20),
                             "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f"),
-                            "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f"),
+                            "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f", help="今日のトレンドに合致"),
                             "状態": st.column_config.TextColumn("判定", width="small"),
                             "属性": st.column_config.TextColumn("根拠", width="large"),
                         },
@@ -577,6 +610,7 @@ def main():
     st.sidebar.subheader("🆕 新規分析")
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
+    
     if uploaded_progress:
         try:
             df = pd.read_csv(uploaded_progress)
@@ -600,6 +634,7 @@ def main():
                 st.session_state['last_session_key'] = session_key
             else:
                 st.error(f"読み込みエラー: {msg1}")
+    
     if 'analyzed_df' in st.session_state:
         full_df = st.session_state['analyzed_df']
         render_trend_sidebar()
