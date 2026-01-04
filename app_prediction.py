@@ -91,10 +91,8 @@ def load_data(file):
             
         df['単ｵｯｽﾞ'] = pd.to_numeric(df['単ｵｯｽﾞ'].apply(to_half_width), errors='coerce')
 
-        # ★着順の強力クリーニング
-        # 1. 数値化できないものは削除
+        # 着順のクリーニング
         df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
-        # 2. 0以下 または 19以上(異常値) は削除 (誤って枠番やオッズを読み込んだ場合の対策)
         df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
         
         return df.copy(), "success"
@@ -140,7 +138,7 @@ def extract_patterns(row):
 def analyze_haichi_advanced(df_curr, df_prev=None):
     df = df_curr.copy()
     
-    # 分析直前にもクリーニング
+    # 強制クリーニング
     df['着順'] = pd.to_numeric(df['着順'], errors='coerce')
     df.loc[(df['着順'] <= 0) | (df['着順'] > 18), '着順'] = np.nan
     
@@ -427,7 +425,7 @@ def render_race_forecast(full_df):
     
     future_mask = pd.to_numeric(df['着順'], errors='coerce').isna()
     if not future_mask.any():
-        st.info("全てのレースが終了しています。")
+        st.info("全てのレースが終了しています（または着順が入力済みです）。")
         return
 
     def check_blue_reverse(row, context_df):
@@ -611,6 +609,8 @@ def main():
     uploaded_curr = st.sidebar.file_uploader("当日出馬表 (必須)", type=['xlsx', 'csv'], key="curr")
     uploaded_prev = st.sidebar.file_uploader("前日出馬表 (土日連動用)", type=['xlsx', 'csv'], key="prev")
     
+    full_df = None # 変数を初期化
+
     if uploaded_progress:
         try:
             df = pd.read_csv(uploaded_progress)
@@ -636,17 +636,24 @@ def main():
                 st.error(f"読み込みエラー: {msg1}")
     
     if 'analyzed_df' in st.session_state:
+        full_df = st.session_state['analyzed_df']
+        
+        # 強制リセット: メモリ内のデータに対しても「0→NaN」を適用
+        full_df['着順'] = pd.to_numeric(full_df['着順'], errors='coerce')
+        full_df.loc[(full_df['着順'] <= 0) | (full_df['着順'] > 18), '着順'] = np.nan
+        st.session_state['analyzed_df'] = full_df # 更新
+        
         # サイドバーにリセットボタンを設置
         st.sidebar.markdown("---")
-        if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。全ての着順をクリアします。"):
-            full_df = st.session_state['analyzed_df']
+        if st.sidebar.button("⚠️ 着順データを全リセット", help="『終了』と誤判定される場合に押してください。"):
             full_df['着順'] = np.nan
-            # 動的ポイントも再計算
             full_df = update_dynamic_points_chain(full_df)
             st.session_state['analyzed_df'] = full_df
             st.success("着順データを全てリセットしました！")
             st.rerun()
 
+    # full_dfが有効な場合のみ描画処理を行う
+    if full_df is not None:
         render_trend_sidebar()
         csv = full_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button(
