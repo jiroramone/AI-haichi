@@ -11,44 +11,38 @@ st.set_page_config(page_title="配置馬券術AI分析システム", layout="wid
 LEARNING_FILE = "haichi_learning_data.csv"
 
 # --- 2025年JRAリーディング確定版データ ---
-# 1. SS級 (年間100勝以上・絶対王者クラス) -> 場所問わず大幅加点
 JOCKEYS_SS = [
     "ルメール", "戸崎圭太", "松山弘平", "横山武史", "坂井瑠星", "川田将雅"
 ]
-
-# 2. 関東上位 (美浦所属の好調騎手) -> 関東会場で加点
 JOCKEYS_KANTO = [
     "丹内祐次", "佐々木大輔", "横山和生", "菅原明良", 
     "三浦皇成", "津村明秀", "横山典弘", "田辺裕信"
 ]
-
-# 3. 関西上位 (栗東所属の好調騎手) -> 関西会場で加点
 JOCKEYS_KANSAI = [
     "岩田望来", "高杉吏麒", "北村友一", "武豊", 
     "団野大成", "鮫島克駿", "吉村誠之助", "荻野極", "西村淳也"
 ]
 
-# 会場定義
 PLACE_KANTO = ['中山', '東京', '福島', '新潟']
 PLACE_KANSAI = ['京都', '阪神', '中京', '小倉', '札幌', '函館'] 
 
 # ポイント配分設定
 DEFAULT_POINTS = {
-    'pair_jockey': 4.0,          # 騎手ペア
-    'pair_stable_owner': 0.5,    # 厩舎・馬主ペア
-    'blue_jockey': 5.0,          # 騎手青塗
-    'blue_stable_owner': 1.0,    # 厩舎・馬主青塗
-    'blue_neighbor': 2.0,        # 青塗隣
-    'sandwich_bonus': 5.0,       # 青塗サンドイッチ
-    'stable_symmetry': 1.0,      # 厩舎対称配置
+    'pair_jockey': 4.0,          
+    'pair_stable_owner': 0.5,    
+    'blue_jockey': 5.0,          
+    'blue_stable_owner': 1.0,    
+    'blue_neighbor': 2.0,        
+    'sandwich_bonus': 5.0,       
+    'stable_symmetry': 1.0,      
     'stable_symmetry_neighbor': 1.0, 
-    'continuous': 2.0,           # 連続レース配置
-    'odds_rank_bonus': 1.0,      # 1~5番人気
-    'prev_day_same_fail': 2.0,   # 前日同R同配置で凡走
-    'prev_day_same_win': -2.0,   # 前日同R同配置で好走
-    'trend_bonus': 3.0,          # トレンド加算
-    'learning_bonus': 3.0,       # 学習データ加算
-    'leading_jockey_bonus': 2.0  # リーディング騎手加算
+    'continuous': 2.0,           
+    'odds_rank_bonus': 1.0,      
+    'prev_day_same_fail': 2.0,   
+    'prev_day_same_win': -2.0,   
+    'trend_bonus': 3.0,          
+    'learning_bonus': 3.0,       
+    'leading_jockey_bonus': 2.0  
 }
 
 def to_half_width(text):
@@ -288,23 +282,19 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
 
     idx_map = {(row['場名'], row['R'], row['正番']): i for i, row in df.iterrows()}
 
-    # ★リーディング騎手チェック (地域別)
+    # ★リーディング騎手チェック
     for idx, row in df.iterrows():
         jockey_name = str(row['騎手'])
         place_name = str(row['場名'])
-        
         is_bonus = False
         leading_type = ""
 
-        # 1. SS級 (どこでも)
         if any(j in jockey_name for j in JOCKEYS_SS):
             is_bonus = True
             leading_type = "SS"
-        # 2. 関東 (関東会場のみ)
         elif place_name in PLACE_KANTO and any(j in jockey_name for j in JOCKEYS_KANTO):
             is_bonus = True
             leading_type = "関東"
-        # 3. 関西 (関西会場のみ)
         elif place_name in PLACE_KANSAI and any(j in jockey_name for j in JOCKEYS_KANSAI):
             is_bonus = True
             leading_type = "関西"
@@ -594,28 +584,47 @@ def render_learning_section(full_df):
             pd.read_csv(uploaded_learn).to_csv(LEARNING_FILE, index=False)
             st.sidebar.success("復元しました")
 
-def render_trend_main():
-    if 'current_trends' in st.session_state and st.session_state['current_trends']:
-        st.markdown("### 📊 今日の会場別好走パターン (トレンド)")
-        trends = st.session_state['current_trends']
-        places = list(trends.keys())
-        if not places:
-            st.info("データ収集中...")
-            return
-        cols = st.columns(len(places))
-        for i, place in enumerate(places):
-            data = trends[place]
-            with cols[i]:
-                st.success(f"**{place} の傾向**")
-                if not data:
-                    st.caption("データなし")
-                    continue
-                for kw, val in data.items():
-                    rate_pct = int(val['rate'] * 100)
-                    if "パターン" in kw:
-                        st.markdown(f"- :red[**{kw}**]: 好走率 **{rate_pct}%** ({val['count']}件)")
-                    else:
-                        st.markdown(f"- {kw}: 好走率 **{rate_pct}%** ({val['count']}件)")
+def render_trend_report_tab(full_df):
+    """新設: 傾向レポートタブ"""
+    st.info("📊 蓄積された学習データを元に、現在有効なパターンの統計を表示します。")
+    
+    learning_df = load_learning_data()
+    if learning_df.empty:
+        st.warning("⚠️ 学習データがまだありません。レース結果を入力して「結果を学習」ボタンを押してください。")
+        return
+
+    learning_df['is_win'] = pd.to_numeric(learning_df['着順'], errors='coerce') == 1
+    learning_df['is_fukusho'] = pd.to_numeric(learning_df['着順'], errors='coerce') <= 3
+    
+    places = learning_df['場名'].unique()
+    tabs = st.tabs(list(places))
+    
+    for tab, place in zip(tabs, places):
+        with tab:
+            place_data = learning_df[learning_df['場名'] == place]
+            if place_data.empty: continue
+            
+            # パターン別集計
+            stats = place_data.groupby('パターン').agg(
+                件数=('着順', 'count'),
+                勝率=('is_win', 'mean'),
+                複勝率=('is_fukusho', 'mean')
+            ).reset_index()
+            
+            # 信頼度フィルター (最低3件以上)
+            valid_stats = stats[stats['件数'] >= 3].sort_values('複勝率', ascending=False)
+            
+            if not valid_stats.empty:
+                st.markdown(f"#### 🏆 {place}の好走パターンランキング")
+                st.dataframe(
+                    valid_stats.style.format({
+                        '勝率': '{:.1%}',
+                        '複勝率': '{:.1%}'
+                    }),
+                    use_container_width=True
+                )
+            else:
+                st.caption("データ収集中... (各パターン3件以上で表示されます)")
 
 def render_race_forecast(full_df):
     st.markdown("### 🎯 厳選勝負レース (推奨買い目)")
@@ -651,33 +660,36 @@ def render_race_forecast(full_df):
     def calculate_rank_and_reason(row, context_df):
         odds = pd.to_numeric(row['単ｵｯｽﾞ'], errors='coerce')
         if pd.notna(odds) and odds >= odds_limit:
-            return "C", f"【穴除外】オッズ{odds}倍 / " + row['属性']
+            return "－", f"【穴除外】オッズ{odds}倍 / " + row['属性']
         
         base_points = row.get('基礎ポイント', 0)
         is_reverse, is_jockey_origin, reverse_msg = check_blue_reverse(row, context_df)
         new_reason = row['属性']
         
-        # SSランク
+        # ◎ 本命 (旧SS)
         if is_reverse:
             new_reason = f"【鉄板】{reverse_msg} / " + new_reason
-            if is_jockey_origin: return "SS", new_reason
-            else: return "S", new_reason 
+            if is_jockey_origin: return "◎", new_reason
+            else: return "〇", new_reason 
             
-        # Sランク
+        # 〇 対抗 (旧S)
         if row.get('動的ポイント', 0) > 0:
             if base_points >= 6.0: 
-                return "S", f"【激熱】直前ペア凡走+複合好配置(点数{base_points:.1f}) / {new_reason}"
+                return "〇", f"【激熱】直前ペア凡走+複合好配置(点数{base_points:.1f}) / {new_reason}"
             else:
-                return "B", f"【注】直前ペア凡走(単独) / {new_reason}" 
+                return "△", f"【注】直前ペア凡走(単独) / {new_reason}" 
 
-        if row.get('合計ポイント', 0) >= 12.0: return "A", new_reason
-        if row.get('合計ポイント', 0) >= 8.0: return "B", new_reason
-        return "C", new_reason
+        # ▲ 単穴 (旧A)
+        if row.get('合計ポイント', 0) >= 12.0: return "▲", new_reason
+        
+        # △ 連下 (旧B)
+        if row.get('合計ポイント', 0) >= 8.0: return "△", new_reason
+        
+        return "－", new_reason
 
     places = sorted(df['場名'].unique())
     has_any = False
     
-    # 安定化のためラジオボタン
     selected_place = st.radio("推奨レースを確認する会場", places, horizontal=True, key="forecast_place")
     
     place_df = df[df['場名'] == selected_place]
@@ -690,10 +702,12 @@ def render_race_forecast(full_df):
         race_df['ランク'] = [r[0] for r in results]
         race_df['拡張根拠'] = [r[1] for r in results]
         
-        axis_candidates = race_df[race_df['ランク'].isin(['SS', 'S'])]
+        target_ranks = ['◎', '〇', '▲']
+        axis_candidates = race_df[race_df['ランク'].isin(target_ranks)]
+        
         if not axis_candidates.empty:
             has_any = True
-            rank_map = {'SS': 3, 'S': 2}
+            rank_map = {'◎': 3, '〇': 2, '▲': 1, '△': 0, '－': -1}
             axis_candidates['rank_score'] = axis_candidates['ランク'].map(rank_map)
             axis_horse = axis_candidates.sort_values(['rank_score', '合計ポイント'], ascending=[False, False]).iloc[0]
             
@@ -707,7 +721,7 @@ def render_race_forecast(full_df):
             
             label = f"{r_num}R 【{axis_horse['ランク']}】 {axis_horse['馬名']} (軸)"
             with st.expander(label, expanded=True):
-                rank_color = "red" if axis_horse['ランク'] == "SS" else "orange"
+                rank_color = "red" if axis_horse['ランク'] == "◎" else "orange"
                 st.markdown(f"**軸**: :{rank_color}[{axis_horse['正番']} {axis_horse['馬名']}] ({axis_horse['騎手']})")
                 st.caption(f"根拠: {axis_horse['拡張根拠']}")
                 st.write(f"相手: **{opp_str}**")
@@ -716,77 +730,85 @@ def render_race_forecast(full_df):
         st.info(f"この会場に推奨馬はありません（オッズ{odds_limit}倍以下で条件合致せず）")
 
 def render_main_tabs(full_df, points_config):
-    places = sorted(full_df['場名'].unique())
-    if not places: return
+    # ★メインタブ構造: ここに「分析メイン」と「レポート」を分ける
+    main_tabs = st.tabs(["📋 分析メイン", "📊 傾向レポート"])
     
-    # ラジオボタンで会場とレースを選択 (タブは廃止して軽量化)
-    selected_place = st.radio("開催会場", places, horizontal=True, key="main_place_select")
-    place_df = full_df[full_df['場名'] == selected_place]
-    
-    st.write("---")
-    
-    races = sorted(place_df['R'].unique())
-    selected_race = st.radio("レースを選択", races, horizontal=True, format_func=lambda x: f"{x}R", key="main_race_select")
-    
-    r_num = selected_race
-    race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
-    
-    def get_status(row):
-        if row['動的ポイント'] > 0: return "🔥激熱"
-        if row['動的ポイント'] < 0: return "🛑終了"
-        if row['合計ポイント'] >= 10: return "⭐本命"
-        return "―"
-    
-    def get_link(row):
-        links = []
-        for t in row.get('ペア対象_list', []):
-            icon = "🔙" if t['R'] < row['R'] else "🔜"
-            links.append(f"{icon}{t['R']}R")
-        return " ".join(links)
-
-    race_df['状態'] = race_df.apply(get_status, axis=1)
-    race_df['連動'] = race_df.apply(get_link, axis=1)
-    
-    disabled_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', 
-                        '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
-    
-    display_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '着順', 
-                    '合計ポイント', '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
-    
-    with st.form(key=f"form_{selected_place}_{r_num}"):
-        st.caption("👇 着順入力後、更新ボタンを押してください。")
-        edited = st.data_editor(
-            race_df[display_cols],
-            disabled=disabled_cols, 
-            column_config={
-                "枠番": st.column_config.NumberColumn(width="small"),
-                "正番": st.column_config.NumberColumn(width="small"),
-                "馬名": st.column_config.TextColumn(width="medium"),
-                "騎手": st.column_config.TextColumn(width="small"),
-                "単ｵｯｽﾞ": st.column_config.NumberColumn("オッズ", format="%.1f"),
-                "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d", help="確定した着順を入力"),
-                "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20),
-                "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f"),
-                "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f"),
-                "状態": st.column_config.TextColumn("判定", width="small"),
-                "連動": st.column_config.TextColumn("連動", width="small"),
-                "属性": st.column_config.TextColumn("根拠", width="large"),
-            },
-            hide_index=True,
-            use_container_width=True,
-            key=f"ed_{selected_place}_{r_num}"
-        )
+    # --- タブ1: 従来の分析画面 ---
+    with main_tabs[0]:
+        places = sorted(full_df['場名'].unique())
+        if not places: return
         
-        submit = st.form_submit_button("データ更新 & 再計算")
-        if submit:
-            updates = edited.set_index('正番')['着順'].to_dict()
-            full_current = st.session_state['analyzed_df']
-            for idx in full_current[(full_current['場名']==selected_place) & (full_current['R']==r_num)].index:
-                n = full_current.at[idx, '正番']
-                full_current.at[idx, '着順'] = updates.get(n)
-            new_df = update_dynamic_points_chain(full_current, points_config)
-            st.session_state['analyzed_df'] = new_df
-            st.rerun()
+        selected_place = st.radio("開催会場", places, horizontal=True, key="main_place_select")
+        place_df = full_df[full_df['場名'] == selected_place]
+        
+        st.write("---")
+        
+        races = sorted(place_df['R'].unique())
+        selected_race = st.radio("レースを選択", races, horizontal=True, format_func=lambda x: f"{x}R", key="main_race_select")
+        
+        r_num = selected_race
+        race_df = place_df[place_df['R'] == r_num].sort_values('正番').copy()
+        
+        def get_status(row):
+            if row['動的ポイント'] > 0: return "🔥激熱"
+            if row['動的ポイント'] < 0: return "🛑終了"
+            if row['合計ポイント'] >= 10: return "⭐本命"
+            return "―"
+        
+        def get_link(row):
+            links = []
+            for t in row.get('ペア対象_list', []):
+                icon = "🔙" if t['R'] < row['R'] else "🔜"
+                links.append(f"{icon}{t['R']}R")
+            return " ".join(links)
+
+        race_df['状態'] = race_df.apply(get_status, axis=1)
+        race_df['連動'] = race_df.apply(get_link, axis=1)
+        
+        disabled_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '合計ポイント', 
+                            '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
+        
+        display_cols = ['枠番', '正番', '馬名', '騎手', '単ｵｯｽﾞ', '着順', 
+                        '合計ポイント', '動的ポイント', 'トレンドポイント', '状態', '連動', '属性']
+        
+        with st.form(key=f"form_{selected_place}_{r_num}"):
+            st.caption("👇 着順入力後、更新ボタンを押してください。")
+            edited = st.data_editor(
+                race_df[display_cols],
+                disabled=disabled_cols, 
+                column_config={
+                    "枠番": st.column_config.NumberColumn(width="small"),
+                    "正番": st.column_config.NumberColumn(width="small"),
+                    "馬名": st.column_config.TextColumn(width="medium"),
+                    "騎手": st.column_config.TextColumn(width="small"),
+                    "単ｵｯｽﾞ": st.column_config.NumberColumn("オッズ", format="%.1f"),
+                    "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=18, format="%d", help="確定した着順を入力"),
+                    "合計ポイント": st.column_config.ProgressColumn("スコア", format="%.1f", min_value=-5, max_value=20),
+                    "動的ポイント": st.column_config.NumberColumn("補正", format="%+.1f"),
+                    "トレンドポイント": st.column_config.NumberColumn("傾向", format="%+.1f"),
+                    "状態": st.column_config.TextColumn("判定", width="small"),
+                    "連動": st.column_config.TextColumn("連動", width="small"),
+                    "属性": st.column_config.TextColumn("根拠", width="large"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key=f"ed_{selected_place}_{r_num}"
+            )
+            
+            submit = st.form_submit_button("データ更新 & 再計算")
+            if submit:
+                updates = edited.set_index('正番')['着順'].to_dict()
+                full_current = st.session_state['analyzed_df']
+                for idx in full_current[(full_current['場名']==selected_place) & (full_current['R']==r_num)].index:
+                    n = full_current.at[idx, '正番']
+                    full_current.at[idx, '着順'] = updates.get(n)
+                new_df = update_dynamic_points_chain(full_current, points_config)
+                st.session_state['analyzed_df'] = new_df
+                st.rerun()
+
+    # --- タブ2: 新機能「傾向レポート」 ---
+    with main_tabs[1]:
+        render_trend_report_tab(full_df)
 
 # --- 7. メイン処理フロー ---
 def main():
@@ -856,8 +878,7 @@ def main():
         
         render_main_tabs(full_df, points_config)
         st.divider()
-        render_trend_main()
-        st.divider()
+        # render_trend_main() # レポート機能と重複するため削除
         render_race_forecast(full_df)
     else:
         st.info("👈 サイドバーからデータをアップロードしてください。\n(例: 260104全出走馬.csv)")
