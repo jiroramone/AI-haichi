@@ -58,7 +58,7 @@ def normalize_name(x):
     s = re.split(r'[\(（]', s)[0]
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み ---
+# --- 2. データ読み込み (強化版) ---
 @st.cache_data
 def load_data(file):
     try:
@@ -75,6 +75,7 @@ def load_data(file):
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
+        # ヘッダー探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -85,7 +86,7 @@ def load_data(file):
         df.columns = df.columns.astype(str).str.strip()
         
         name_map = {
-            '場所': '場名', '開催': '場名', '競馬場': '場名',
+            '場所': '場名', '開催': '場名', '競馬場': '場名', '開催会場': '場名',
             '調教師': '厩舎', '調教師名': '厩舎', '厩舎名': '厩舎',
             '騎手名': '騎手', 'レース': 'R', 'Ｒ': 'R', '番': '正番', '馬番': '正番',
             '単オッズ': '単ｵｯｽﾞ', '単勝オッズ': '単ｵｯｽﾞ', 'オッズ': '単ｵｯｽﾞ',
@@ -96,6 +97,7 @@ def load_data(file):
         if '着順' in df.columns: df = df.drop(columns=['着順'])
         df['着順'] = np.nan 
 
+        # 厩舎・騎手カラム補正
         if '厩舎' not in df.columns:
             cols = df.columns.tolist()
             if '斤量' in cols:
@@ -110,6 +112,11 @@ def load_data(file):
         ensure_cols = ['場名', 'R', '馬名', '正番', '騎手', '厩舎', '馬主', '単ｵｯｽﾞ']
         for col in ensure_cols:
             if col not in df.columns: df[col] = np.nan
+
+        # ★重要: ゴミデータの排除 (ヘッダー行の残留対策)
+        # 「場名」が "場所", "開催", "開催会場" などの行を削除
+        if '場名' in df.columns:
+            df = df[~df['場名'].astype(str).isin(['場所', '開催', '開催会場', '場名', 'nan'])]
 
         df['R'] = pd.to_numeric(df['R'].apply(to_half_width), errors='coerce')
         df['正番'] = pd.to_numeric(df['正番'].apply(to_half_width), errors='coerce')
@@ -585,9 +592,7 @@ def render_learning_section(full_df):
             st.sidebar.success("復元しました")
 
 def render_trend_report_tab(full_df):
-    """新設: 傾向レポートタブ"""
     st.info("📊 蓄積された学習データを元に、現在有効なパターンの統計を表示します。")
-    
     learning_df = load_learning_data()
     if learning_df.empty:
         st.warning("⚠️ 学習データがまだありません。レース結果を入力して「結果を学習」ボタンを押してください。")
@@ -603,24 +608,17 @@ def render_trend_report_tab(full_df):
         with tab:
             place_data = learning_df[learning_df['場名'] == place]
             if place_data.empty: continue
-            
-            # パターン別集計
             stats = place_data.groupby('パターン').agg(
                 件数=('着順', 'count'),
                 勝率=('is_win', 'mean'),
                 複勝率=('is_fukusho', 'mean')
             ).reset_index()
-            
-            # 信頼度フィルター (最低3件以上)
             valid_stats = stats[stats['件数'] >= 3].sort_values('複勝率', ascending=False)
             
             if not valid_stats.empty:
                 st.markdown(f"#### 🏆 {place}の好走パターンランキング")
                 st.dataframe(
-                    valid_stats.style.format({
-                        '勝率': '{:.1%}',
-                        '複勝率': '{:.1%}'
-                    }),
+                    valid_stats.style.format({'勝率': '{:.1%}', '複勝率': '{:.1%}'}),
                     use_container_width=True
                 )
             else:
@@ -666,25 +664,19 @@ def render_race_forecast(full_df):
         is_reverse, is_jockey_origin, reverse_msg = check_blue_reverse(row, context_df)
         new_reason = row['属性']
         
-        # ◎ 本命 (旧SS)
         if is_reverse:
             new_reason = f"【鉄板】{reverse_msg} / " + new_reason
             if is_jockey_origin: return "◎", new_reason
             else: return "〇", new_reason 
             
-        # 〇 対抗 (旧S)
         if row.get('動的ポイント', 0) > 0:
             if base_points >= 6.0: 
                 return "〇", f"【激熱】直前ペア凡走+複合好配置(点数{base_points:.1f}) / {new_reason}"
             else:
                 return "△", f"【注】直前ペア凡走(単独) / {new_reason}" 
 
-        # ▲ 単穴 (旧A)
         if row.get('合計ポイント', 0) >= 12.0: return "▲", new_reason
-        
-        # △ 連下 (旧B)
         if row.get('合計ポイント', 0) >= 8.0: return "△", new_reason
-        
         return "－", new_reason
 
     places = sorted(df['場名'].unique())
@@ -730,20 +722,20 @@ def render_race_forecast(full_df):
         st.info(f"この会場に推奨馬はありません（オッズ{odds_limit}倍以下で条件合致せず）")
 
 def render_main_tabs(full_df, points_config):
-    # ★メインタブ構造: ここに「分析メイン」と「レポート」を分ける
     main_tabs = st.tabs(["📋 分析メイン", "📊 傾向レポート"])
     
-    # --- タブ1: 従来の分析画面 ---
     with main_tabs[0]:
         places = sorted(full_df['場名'].unique())
         if not places: return
         
+        # ★修正: ラジオボタンで軽量化
         selected_place = st.radio("開催会場", places, horizontal=True, key="main_place_select")
         place_df = full_df[full_df['場名'] == selected_place]
         
         st.write("---")
         
         races = sorted(place_df['R'].unique())
+        # ★修正: レースもラジオボタンで軽量化
         selected_race = st.radio("レースを選択", races, horizontal=True, format_func=lambda x: f"{x}R", key="main_race_select")
         
         r_num = selected_race
@@ -806,7 +798,6 @@ def render_main_tabs(full_df, points_config):
                 st.session_state['analyzed_df'] = new_df
                 st.rerun()
 
-    # --- タブ2: 新機能「傾向レポート」 ---
     with main_tabs[1]:
         render_trend_report_tab(full_df)
 
@@ -878,7 +869,6 @@ def main():
         
         render_main_tabs(full_df, points_config)
         st.divider()
-        # render_trend_main() # レポート機能と重複するため削除
         render_race_forecast(full_df)
     else:
         st.info("👈 サイドバーからデータをアップロードしてください。\n(例: 260104全出走馬.csv)")
