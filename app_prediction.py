@@ -26,10 +26,10 @@ JOCKEYS_KANSAI = [
 PLACE_KANTO = ['中山', '東京', '福島', '新潟']
 PLACE_KANSAI = ['京都', '阪神', '中京', '小倉', '札幌', '函館'] 
 
-# ポイント配分設定 (エラー修正版)
+# ポイント配分設定
 DEFAULT_POINTS = {
     'pair_jockey': 4.0,          
-    'pair_jockey_same_bonus': 2.0, # ★復旧: 同番ボーナス
+    'pair_jockey_same_bonus': 2.0, 
     'pair_stable_owner': 0.5,    
     'blue_jockey': 5.0,          
     'blue_stable_owner': 1.0,    
@@ -112,7 +112,6 @@ def load_data(file):
         for col in ensure_cols:
             if col not in df.columns: df[col] = np.nan
 
-        # ゴミデータの排除
         if '場名' in df.columns:
             df = df[~df['場名'].astype(str).isin(['場所', '開催', '開催会場', '場名', 'nan'])]
 
@@ -551,7 +550,7 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
             num = int(num)
             if cat in finished_blue_map and num in finished_blue_map[cat]:
                 is_blue_finished = True
-                blue_cats.append(f"青塗({cat})済")
+                blue_cats.append(f"青塗({cat})")
         
         if is_blue_finished:
             bonus_map[idx] = bonus_map.get(idx, 0) - 10.0
@@ -788,9 +787,13 @@ def render_main_tabs(full_df, points_config):
             
             finished_cats = str(row.get('終了要因', ''))
             if finished_cats:
-                if '青塗' in finished_cats: return "🛑青塗済"
+                # 優先順位をつけて表示
+                if '青塗(騎手)' in finished_cats: return "🛑青騎済"
+                if '青塗(厩舎)' in finished_cats: return "🛑青厩済"
+                if '青塗(馬主)' in finished_cats: return "🛑青馬済"
                 if '騎手' in finished_cats: return "🛑騎手済"
                 if '厩舎' in finished_cats: return "🛑厩舎済"
+                if '馬主' in finished_cats: return "🛑馬主済"
                 return "🛑終了"
                 
             if row['動的ポイント'] < 0: return "🛑終了"
