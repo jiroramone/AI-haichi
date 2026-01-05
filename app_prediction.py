@@ -58,7 +58,7 @@ def normalize_name(x):
     s = re.split(r'[\(（]', s)[0]
     return re.sub(r'[★☆▲△◇$*]', '', s)
 
-# --- 2. データ読み込み (強化版) ---
+# --- 2. データ読み込み ---
 @st.cache_data
 def load_data(file):
     try:
@@ -75,7 +75,6 @@ def load_data(file):
             try: df = pd.read_csv(file, encoding='utf-8')
             except: df = pd.read_csv(file, encoding='cp932')
         
-        # ヘッダー探索
         if not any(col in str(df.columns) for col in ['馬', '番', 'R', '騎']):
             for i in range(min(len(df), 10)):
                 if any(x in str(df.iloc[i].values) for x in ['馬', '番', 'R']):
@@ -97,7 +96,6 @@ def load_data(file):
         if '着順' in df.columns: df = df.drop(columns=['着順'])
         df['着順'] = np.nan 
 
-        # 厩舎・騎手カラム補正
         if '厩舎' not in df.columns:
             cols = df.columns.tolist()
             if '斤量' in cols:
@@ -113,8 +111,7 @@ def load_data(file):
         for col in ensure_cols:
             if col not in df.columns: df[col] = np.nan
 
-        # ★重要: ゴミデータの排除 (ヘッダー行の残留対策)
-        # 「場名」が "場所", "開催", "開催会場" などの行を削除
+        # ゴミデータの排除
         if '場名' in df.columns:
             df = df[~df['場名'].astype(str).isin(['場所', '開催', '開催会場', '場名', 'nan'])]
 
@@ -343,7 +340,8 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
             idx = idx_map.get((b['場名'], b['R'], neighbor_num))
             if idx is not None:
                 current_attrs = df.at[idx, '属性_list']
-                tag = f"△{b['cat']}青塗隣"
+                # ★修正: 親の番号をタグに含める
+                tag = f"△{b['cat']}青塗隣(No.{b['正番']})"
                 if tag not in current_attrs:
                     df.at[idx, '合計ポイント'] += points_config['blue_neighbor']
                     df.at[idx, '属性_list'].append(tag)
@@ -378,6 +376,9 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
                 if patterns:
                     is_continuous = (abs(r2['R'] - r1['R']) == 1)
                     bonus = points_config['continuous'] if is_continuous else 0
+                    
+                    if 'A' in patterns:
+                        bonus += points_config['pair_jockey_same_bonus'] if category == '騎手' else 0
                     
                     pattern_str = ",".join(patterns)
                     
@@ -500,6 +501,9 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
         df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(x))
 
     bonus_map = {} 
+    finished_map = {} # {idx: [要因リスト]}
+    
+    # --- 1. ペアのシーソー判定 ---
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2 or name == '': continue
@@ -513,12 +517,55 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
                 rank = pd.to_numeric(curr_row['着順'], errors='coerce')
                 is_finished = pd.notna(rank)
                 is_win = is_finished and rank <= 3
+                
                 if not expectation_alive:
                     bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) - 2.0
+                    if curr_idx not in finished_map: finished_map[curr_idx] = []
+                    finished_map[curr_idx].append(f"{category}済")
                 elif not is_finished:
                     if i > 0: bonus_map[curr_idx] = bonus_map.get(curr_idx, 0) + 2.0
+                
                 if is_win: expectation_alive = False
+
+    # --- 2. 青塗の終了判定 (★新機能) ---
+    finished_blue_map = {} # {'騎手': {1, 5}}
     
+    # 全着順をチェックして終了した青塗番号を特定
+    for idx, row in df.iterrows():
+        rank = pd.to_numeric(row['着順'], errors='coerce')
+        if pd.isna(rank) or rank > 3: continue 
+
+        attrs = str(row['属性'])
+        # 本体: ★騎手青塗(No.1) / 隣: △騎手青塗隣(No.1)
+        matches = re.findall(r'[★△](騎手|厩舎|馬主)青塗.*\(No\.(\d+)\)', attrs)
+        for cat, num in matches:
+            num = int(num)
+            if cat not in finished_blue_map: finished_blue_map[cat] = set()
+            finished_blue_map[cat].add(num)
+
+    # 終了した青塗グループに属する馬を減点
+    for idx, row in df.iterrows():
+        attrs = str(row['属性'])
+        matches = re.findall(r'[★△](騎手|厩舎|馬主)青塗.*\(No\.(\d+)\)', attrs)
+        is_blue_finished = False
+        blue_cats = []
+        
+        for cat, num in matches:
+            num = int(num)
+            if cat in finished_blue_map and num in finished_blue_map[cat]:
+                is_blue_finished = True
+                blue_cats.append(f"青塗({cat})済")
+        
+        if is_blue_finished:
+            bonus_map[idx] = bonus_map.get(idx, 0) - 10.0 # 大幅減点で終了扱い
+            if idx not in finished_map: finished_map[idx] = []
+            finished_map[idx].extend(list(set(blue_cats)))
+
+    # --- 3. 反映 ---
+    df['終了要因'] = ""
+    for idx, cats in finished_map.items():
+        df.at[idx, '終了要因'] = ",".join(list(set(cats)))
+
     for idx, bonus in bonus_map.items():
         df.at[idx, '動的ポイント'] += bonus
         df.at[idx, '合計ポイント'] += bonus 
@@ -728,14 +775,12 @@ def render_main_tabs(full_df, points_config):
         places = sorted(full_df['場名'].unique())
         if not places: return
         
-        # ★修正: ラジオボタンで軽量化
         selected_place = st.radio("開催会場", places, horizontal=True, key="main_place_select")
         place_df = full_df[full_df['場名'] == selected_place]
         
         st.write("---")
         
         races = sorted(place_df['R'].unique())
-        # ★修正: レースもラジオボタンで軽量化
         selected_race = st.radio("レースを選択", races, horizontal=True, format_func=lambda x: f"{x}R", key="main_race_select")
         
         r_num = selected_race
@@ -743,6 +788,15 @@ def render_main_tabs(full_df, points_config):
         
         def get_status(row):
             if row['動的ポイント'] > 0: return "🔥激熱"
+            
+            # 終了要因を詳細表示
+            finished_cats = str(row.get('終了要因', ''))
+            if finished_cats:
+                if '青塗' in finished_cats: return "🛑青塗済"
+                if '騎手' in finished_cats: return "🛑騎手済"
+                if '厩舎' in finished_cats: return "🛑厩舎済"
+                return "🛑終了"
+                
             if row['動的ポイント'] < 0: return "🛑終了"
             if row['合計ポイント'] >= 10: return "⭐本命"
             return "―"
@@ -869,6 +923,7 @@ def main():
         
         render_main_tabs(full_df, points_config)
         st.divider()
+        # render_trend_main()
         render_race_forecast(full_df)
     else:
         st.info("👈 サイドバーからデータをアップロードしてください。\n(例: 260104全出走馬.csv)")
