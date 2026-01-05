@@ -26,9 +26,10 @@ JOCKEYS_KANSAI = [
 PLACE_KANTO = ['中山', '東京', '福島', '新潟']
 PLACE_KANSAI = ['京都', '阪神', '中京', '小倉', '札幌', '函館'] 
 
-# ポイント配分設定
+# ポイント配分設定 (エラー修正版)
 DEFAULT_POINTS = {
     'pair_jockey': 4.0,          
+    'pair_jockey_same_bonus': 2.0, # ★復旧: 同番ボーナス
     'pair_stable_owner': 0.5,    
     'blue_jockey': 5.0,          
     'blue_stable_owner': 1.0,    
@@ -340,7 +341,6 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
             idx = idx_map.get((b['場名'], b['R'], neighbor_num))
             if idx is not None:
                 current_attrs = df.at[idx, '属性_list']
-                # ★修正: 親の番号をタグに含める
                 tag = f"△{b['cat']}青塗隣(No.{b['正番']})"
                 if tag not in current_attrs:
                     df.at[idx, '合計ポイント'] += points_config['blue_neighbor']
@@ -378,7 +378,7 @@ def analyze_haichi_advanced(df_curr, df_prev=None, points_config=DEFAULT_POINTS)
                     bonus = points_config['continuous'] if is_continuous else 0
                     
                     if 'A' in patterns:
-                        bonus += points_config['pair_jockey_same_bonus'] if category == '騎手' else 0
+                        bonus += points_config.get('pair_jockey_same_bonus', 0) if category == '騎手' else 0
                     
                     pattern_str = ",".join(patterns)
                     
@@ -501,9 +501,9 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
         df['属性'] = df['属性_list'].apply(lambda x: ' / '.join(x))
 
     bonus_map = {} 
-    finished_map = {} # {idx: [要因リスト]}
+    finished_map = {} 
     
-    # --- 1. ペアのシーソー判定 ---
+    # 1. ペアのシーソー判定
     for category in ['騎手', '厩舎', '馬主']:
         for (place, name), group in df.groupby(['場名', category]):
             if len(group) < 2 or name == '': continue
@@ -527,23 +527,20 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
                 
                 if is_win: expectation_alive = False
 
-    # --- 2. 青塗の終了判定 (★新機能) ---
-    finished_blue_map = {} # {'騎手': {1, 5}}
+    # 2. 青塗の終了判定
+    finished_blue_map = {} 
     
-    # 全着順をチェックして終了した青塗番号を特定
     for idx, row in df.iterrows():
         rank = pd.to_numeric(row['着順'], errors='coerce')
         if pd.isna(rank) or rank > 3: continue 
 
         attrs = str(row['属性'])
-        # 本体: ★騎手青塗(No.1) / 隣: △騎手青塗隣(No.1)
         matches = re.findall(r'[★△](騎手|厩舎|馬主)青塗.*\(No\.(\d+)\)', attrs)
         for cat, num in matches:
             num = int(num)
             if cat not in finished_blue_map: finished_blue_map[cat] = set()
             finished_blue_map[cat].add(num)
 
-    # 終了した青塗グループに属する馬を減点
     for idx, row in df.iterrows():
         attrs = str(row['属性'])
         matches = re.findall(r'[★△](騎手|厩舎|馬主)青塗.*\(No\.(\d+)\)', attrs)
@@ -557,11 +554,10 @@ def update_dynamic_points_chain(df, points_config=DEFAULT_POINTS):
                 blue_cats.append(f"青塗({cat})済")
         
         if is_blue_finished:
-            bonus_map[idx] = bonus_map.get(idx, 0) - 10.0 # 大幅減点で終了扱い
+            bonus_map[idx] = bonus_map.get(idx, 0) - 10.0
             if idx not in finished_map: finished_map[idx] = []
             finished_map[idx].extend(list(set(blue_cats)))
 
-    # --- 3. 反映 ---
     df['終了要因'] = ""
     for idx, cats in finished_map.items():
         df.at[idx, '終了要因'] = ",".join(list(set(cats)))
@@ -615,6 +611,7 @@ def render_sidebar_config():
         
         st.divider()
         points_config['pair_jockey'] = st.slider("騎手ペア点", 0.0, 10.0, 4.0)
+        points_config['pair_jockey_same_bonus'] = st.slider("騎手同番ボーナス", 0.0, 5.0, 2.0)
         points_config['leading_jockey_bonus'] = st.slider("リーディング騎手加算", 0.0, 5.0, 2.0)
         return points_config
     return DEFAULT_POINTS
@@ -789,7 +786,6 @@ def render_main_tabs(full_df, points_config):
         def get_status(row):
             if row['動的ポイント'] > 0: return "🔥激熱"
             
-            # 終了要因を詳細表示
             finished_cats = str(row.get('終了要因', ''))
             if finished_cats:
                 if '青塗' in finished_cats: return "🛑青塗済"
